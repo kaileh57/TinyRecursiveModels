@@ -39,14 +39,15 @@ def cosine_schedule_with_warmup(step, base_lr, warmup_steps, total_steps, min_ra
 
 def create_model(config, metadata, rank):
     """Create model from reference implementation."""
-    model_cfg = dict(
-        **config.model,
-        batch_size=config.training.per_worker_batch_size,
-        vocab_size=metadata['vocab_size'],
-        seq_len=metadata['seq_len'],
-        num_puzzle_identifiers=metadata['num_puzzle_identifiers'],
-        causal=False
-    )
+    # Convert OmegaConf to dict for model config
+    model_cfg = OmegaConf.to_container(config.model, resolve=True)
+    model_cfg.update({
+        'batch_size': config.training.per_worker_batch_size,
+        'vocab_size': metadata['vocab_size'],
+        'seq_len': metadata['seq_len'],
+        'num_puzzle_identifiers': metadata['num_puzzle_identifiers'],
+        'causal': False
+    })
 
     # Remove top-level config keys
     model_cfg.pop('name', None)
@@ -58,7 +59,8 @@ def create_model(config, metadata, rank):
     # Load loss head
     if hasattr(config, 'loss'):
         loss_cls = load_model_class(config.loss.name)
-        model = loss_cls(model, **config.loss.get('params', {}))
+        loss_params = OmegaConf.to_container(config.loss.get('params', {}), resolve=True) if hasattr(config.loss, 'params') else {}
+        model = loss_cls(model, **loss_params)
 
     if rank == 0:
         num_params = sum(p.numel() for p in model.parameters())
