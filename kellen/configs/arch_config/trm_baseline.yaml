@@ -1,0 +1,37 @@
+# TRM Architecture - Baseline Configuration
+# Matches paper's best Sudoku-Extreme setup
+
+name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+# ACT/Halting config
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+# Recursion depth
+H_cycles: 3  # High-level reasoning cycles
+L_cycles: 6  # Low-level latent updates per H_cycle
+
+# Layer depth
+H_layers: 0  # Not used in TRM (kept for compatibility)
+L_layers: 2  # Number of transformer/MLP layers
+
+# Model size
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+# Puzzle embeddings
+puzzle_emb_ndim: 512  # Same as hidden_size
+puzzle_emb_len: 16   # Fixed length for puzzle embedding
+
+# Architectural choices
+mlp_t: true  # Use MLP instead of attention (best for Sudoku)
+pos_encodings: none  # No position encodings (MLP-T doesn't need them)
+forward_dtype: bfloat16  # Use bfloat16 for efficiency
+
+# ACT variant
+no_ACT_continue: true  # Simplified ACT (paper's choice)

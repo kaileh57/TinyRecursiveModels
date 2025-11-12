@@ -1,0 +1,301 @@
+================================================================================
+GOOGLE CLOUD TPU v4-64 INFRASTRUCTURE PLAN
+================================================================================
+
+HARDWARE SPECIFICATIONS
+================================================================================
+Node Name: stable-1 (persistent)
+TPU Type: v4-64
+Architecture:
+- 32 TPU v4 chips
+- 2 cores per chip = 64 total cores
+- Memory: 32GB HBM2e per chip = 1TB total
+- Interconnect: Ultra-high bandwidth 2D torus
+
+Effective Configuration for PyTorch:
+- 8 workers (standard for v4-64)
+- 8 cores per worker
+- 128GB HBM per worker
+- Data-parallel training across workers
+
+PYTORCH/XLA DISTRIBUTED ARCHITECTURE
+================================================================================
+
+TPU Pod Slice Topology:
+┌─────────────────────────────────────┐
+│         TPU v4-64 Pod Slice         │
+├──────────┬──────────┬──────────┬────┤
+│ Worker 0 │ Worker 1 │ Worker 2 │ W3 │  Each worker:
+│ 8 cores  │ 8 cores  │ 8 cores  │ 8c │  - LOCAL_RANK: 0-7
+├──────────┼──────────┼──────────┼────┤  - RANK: [0-7, 8-15, ...]
+│ Worker 4 │ Worker 5 │ Worker 6 │ W7 │  - 8 TPU cores
+│ 8 cores  │ 8 cores  │ 8 cores  │ 8c │  - 128GB HBM
+└──────────┴──────────┴──────────┴────┘  - Shared filesystem
+
+Process Distribution:
+- Total processes: 8 (one per worker)
+- Each process manages 8 TPU cores via XLA
+- WORLD_SIZE = 8
+- RANK ∈ [0, 1, 2, 3, 4, 5, 6, 7]
+
+Environment Variables (PyTorch/XLA):
+- XLA_USE_BF16: 1 (enable bfloat16)
+- XLA_TENSOR_ALLOCATOR_MAXSIZE: 100000000 (100MB)
+- TPU_NUM_DEVICES: 8 (cores per worker)
+- PJRT_DEVICE: TPU
+- RANK: Global rank of process
+- WORLD_SIZE: 8
+- MASTER_ADDR: IP of rank 0 worker
+- MASTER_PORT: 12355 (or any free port)
+
+DISTRIBUTED TRAINING MODES
+================================================================================
+
+Mode 1: Data Parallelism (Primary)
+-----------------------------------
+- Same model replicated on all 8 workers
+- Different data batches per worker
+- Gradient all-reduce after backward pass
+- Effective batch size = per_worker_batch × 8
+
+Example:
+  global_batch_size = 6144
+  per_worker_batch = 6144 / 8 = 768
+  Each worker processes 768 examples, gradients averaged
+
+Mode 2: Hybrid (Future Extension)
+----------------------------------
+- Data parallel across workers
+- Model parallel within worker (if model > 128GB)
+- Not needed for TRM (only ~7M params)
+
+COMMUNICATION PATTERNS
+================================================================================
+
+All-Reduce (Gradient Sync):
+- After loss.backward(), gradients on each worker are averaged
+- PyTorch DistributedDataParallel (DDP) handles automatically
+- XLA mesh collective reduces across TPU cores
+
+Broadcast (Model Initialization):
+- Rank 0 loads checkpoint
+- Broadcast parameters to all workers
+- Ensures all workers start with same weights
+
+Gather (Evaluation):
+- Each worker computes metrics on its shard
+- Reduce metrics to rank 0 for logging
+- Rank 0 aggregates and logs to WandB
+
+Barrier (Synchronization):
+- Wait for all workers before evaluation
+- Checkpoint saving (only rank 0 saves)
+- Prevents race conditions
+
+TPU-SPECIFIC CONSIDERATIONS
+================================================================================
+
+1. XLA Compilation:
+   - First step compiles computation graph (~2-5 min)
+   - Subsequent steps are fast (~100x faster)
+   - Avoid dynamic shapes (breaks compilation cache)
+   - Use fixed batch sizes per epoch
+
+2. Host-Device Transfer:
+   - Minimize CPU ↔ TPU data movement
+   - Keep tensors on TPU throughout training
+   - Use pinned memory for data loading
+
+3. Collective Ops:
+   - All-reduce is highly optimized on TPU interconnect
+   - ~10-100x faster than GPU NCCL for large tensors
+   - Prefer large, infrequent syncs over small, frequent
+
+4. Memory Management:
+   - 128GB per worker is generous for TRM
+   - Can run very large batches (1024+ per worker)
+   - Watch for memory leaks in carry state
+
+5. Checkpointing:
+   - Only rank 0 saves to avoid contention
+   - Save to local disk, then copy to GCS bucket
+   - Use async saves to avoid blocking training
+
+LAUNCH PATTERNS
+================================================================================
+
+Pattern 1: Single-Node Multi-Worker (Our Setup)
+------------------------------------------------
+Command:
+  python -m torch_xla.distributed.xla_dist \
+    --tpu=stable-1 \
+    --restart-tpuvm-pod-server \
+    -- python kellen/experiments/run_experiment.py \
+       --config kellen/configs/exp01_model_scaling.yaml
+
+Explanation:
+- xla_dist automatically sets up distributed environment
+- Spawns 8 processes (one per worker)
+- Sets RANK, WORLD_SIZE, MASTER_ADDR automatically
+
+Pattern 2: Direct torchrun (Alternative)
+-----------------------------------------
+Command (on each worker):
+  torchrun \
+    --nnodes=1 \
+    --nproc_per_node=1 \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$MASTER_ADDR:12355 \
+    kellen/experiments/run_experiment.py \
+      --config kellen/configs/exp01_model_scaling.yaml
+
+Notes:
+- nproc_per_node=1 because XLA manages 8 cores internally
+- Must manually coordinate across workers (complex)
+- xla_dist pattern is preferred
+
+Pattern 3: SPMD (Future)
+-------------------------
+- Single Program, Multiple Data
+- PyTorch/XLA SPMD API for fine-grained control
+- Useful for model parallelism
+- Overkill for TRM
+
+DATA LOADING STRATEGY
+================================================================================
+
+Challenge: Avoid data loading bottleneck
+
+Solution 1: Per-Worker Sharding (Implemented)
+----------------------------------------------
+- Each worker loads different subset of data
+- PuzzleDataset(..., rank=RANK, num_replicas=WORLD_SIZE)
+- No overlap, full dataset coverage
+- Shuffle independently per worker
+
+Solution 2: Prefetching
+------------------------
+- DataLoader(..., num_workers=4, prefetch_factor=4)
+- Prepare next batches while TPU computes
+- Pinned memory for fast transfer
+
+Solution 3: Cached Datasets
+----------------------------
+- Pre-generate augmentations, save to disk
+- Load from local SSD (faster than GCS)
+- Trade disk space for speed
+
+MONITORING & DEBUGGING
+================================================================================
+
+TPU Utilization:
+  watch -n 1 'gcloud compute tpus tpu-vm describe stable-1 \
+    --zone=us-central2-b --format="value(health)"'
+
+Memory Usage:
+  XLA automatically manages HBM
+  Check with: torch_xla.core.xla_model.get_memory_info()
+
+Worker Health:
+  All workers must be reachable
+  If one fails, restart entire pod:
+    gcloud compute tpus tpu-vm restart stable-1 --zone=us-central2-b
+
+Logs:
+  Each worker writes to separate log file:
+    kellen/logs/exp01_worker{RANK}.log
+  Rank 0 aggregates metrics to WandB
+
+TROUBLESHOOTING
+================================================================================
+
+Issue: XLA compilation too slow
+Fix: Ensure batch size is constant; avoid dynamic control flow
+
+Issue: Out of memory
+Fix: Reduce per_worker_batch or max_sequence_length
+
+Issue: Workers desync
+Fix: Add dist.barrier() before evaluation and checkpointing
+
+Issue: Gradient explosion
+Fix: Enable gradient clipping; check learning rate
+
+Issue: Slow data loading
+Fix: Increase num_workers in DataLoader; use local SSD
+
+Issue: Stale checkpoints
+Fix: Verify rank 0 has write permissions to checkpoint dir
+
+OPTIMIZATION CHECKLIST
+================================================================================
+
+□ Use bfloat16 (XLA_USE_BF16=1)
+□ Enable torch.compile() for model (already in pretrain.py)
+□ Fixed batch sizes (no padding, no variable length)
+□ All-reduce gradients only once per step
+□ Minimize host-device transfers
+□ Pin memory in DataLoader
+□ Async checkpoint saving (non-blocking)
+□ Log only from rank 0 (avoid redundant I/O)
+□ Use XLA-optimized ops (avoid custom CUDA kernels)
+□ Profile with torch_xla.debug.profiler
+
+EXPECTED PERFORMANCE
+================================================================================
+
+Baseline Configuration:
+- Model: TRM (7M params)
+- Batch size: 768 per worker × 8 = 6144 global
+- Sequence length: 81 (Sudoku) + 16 (puzzle_emb) = 97
+- Precision: bfloat16
+
+Estimated Throughput:
+- Forward pass: ~5ms per batch per worker
+- Backward pass: ~10ms per batch per worker
+- Gradient sync: ~2ms
+- Total: ~17ms per step
+- Throughput: ~360,000 examples/sec (all workers)
+
+Training Time (Sudoku Baseline):
+- Total examples: 1K puzzles × 1000 aug × 50K epochs = 50B tokens
+- Steps: 50B / 6144 ≈ 8M steps
+- Time: 8M × 17ms ≈ 38 hours
+- With compilation overhead: ~40 hours
+
+Memory Usage:
+- Model: ~28MB (7M params × 4 bytes)
+- Activations: ~2GB per worker (batch=768, seq=97, hidden=512)
+- Gradients: ~28MB
+- Optimizer state: ~56MB (AdamW)
+- Total per worker: ~3GB / 128GB = 2.3% utilization
+
+Headroom:
+- Can increase batch size 40x before OOM
+- Can run much larger models (up to ~2B params)
+
+COST ESTIMATION
+================================================================================
+
+TPU v4-64 Cost: $0 (covered by TRC grant for 30 days)
+Persistent Disk: ~$0.10/GB/month × 500GB ≈ $50/month
+Egress: Negligible (results <100GB)
+Logging: Disable verbose logging to save costs
+
+Total: ~$50/month for storage only (TPU is free)
+
+BEST PRACTICES
+================================================================================
+
+1. Always test on smaller slice first (v4-8) before scaling to v4-64
+2. Save checkpoints every 1000 steps (not just at eval)
+3. Use WandB for live monitoring (rank 0 only)
+4. Keep code on local SSD, data on GCS bucket in same region
+5. Use tmux/screen for persistent sessions
+6. Set up alerting for OOM or worker failures
+7. Version control all config files
+8. Document hyperparameters in config, not in code
+9. Use descriptive run names (include experiment ID)
+10. Archive results to GCS bucket after each experiment
+
+================================================================================
