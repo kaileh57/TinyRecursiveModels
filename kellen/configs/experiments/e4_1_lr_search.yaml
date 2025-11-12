@@ -1,0 +1,14 @@
+# Experiment E4.1: Learning Rate Search
+# Find optimal LR for batch 1024
+
+defaults:
+  - ../base_sudoku_tpu
+
+training:
+  lr: 5e-4  # Try higher LR (vs 4e-4 baseline)
+
+checkpoint:
+  save_dir: "checkpoints/e4_1_lr_search_5e4"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e4_1_lr_search_5e4"

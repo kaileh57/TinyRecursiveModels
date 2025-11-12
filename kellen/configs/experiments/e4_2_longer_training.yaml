@@ -1,0 +1,14 @@
+# Experiment E4.2: Longer Training
+# Train for 100K epochs (2× baseline)
+
+defaults:
+  - ../base_sudoku_tpu
+
+training:
+  epochs: 100000  # Double the paper's 50K
+
+checkpoint:
+  save_dir: "checkpoints/e4_2_longer_training"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e4_2_longer_training"

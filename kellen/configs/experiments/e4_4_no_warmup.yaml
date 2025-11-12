@@ -1,0 +1,14 @@
+# Experiment E4.4: No LR Warmup
+# Test if warmup is necessary
+
+defaults:
+  - ../base_sudoku_tpu
+
+training:
+  lr_warmup_steps: 0  # No warmup
+
+checkpoint:
+  save_dir: "checkpoints/e4_4_no_warmup"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e4_4_no_warmup"

@@ -1,0 +1,17 @@
+# Experiment E4.5: Very Large Batch
+# Test batch 2048 (push the limits)
+
+defaults:
+  - ../base_sudoku_tpu
+
+training:
+  global_batch_size: 2048  # 256 per worker
+  per_worker_batch_size: 256
+  lr: 8e-4  # Linear scaling
+  lr_warmup_steps: 10000  # Longer warmup
+
+checkpoint:
+  save_dir: "checkpoints/e4_5_larger_batch"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e4_5_larger_batch"

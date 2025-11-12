@@ -1,0 +1,17 @@
+# Experiment E3.2: More Training Data
+# Test if more puzzles improve accuracy
+
+defaults:
+  - ../base_sudoku_tpu
+
+# This requires generating a larger dataset (5K puzzles)
+# Run: python dataset/build_sudoku_dataset.py --output-dir data/sudoku-extreme-5k-aug-1000 --subsample-size 5000 --num-aug 1000
+
+data:
+  dataset_path: "gs://your-bucket-name/data/sudoku-extreme-5k-aug-1000"
+
+checkpoint:
+  save_dir: "checkpoints/e3_2_more_data"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e3_2_more_data"

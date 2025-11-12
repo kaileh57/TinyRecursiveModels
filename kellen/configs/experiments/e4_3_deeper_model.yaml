@@ -1,0 +1,14 @@
+# Experiment E4.3: Deeper Model
+# Test 4 layers (vs 2 baseline)
+
+defaults:
+  - ../base_sudoku_tpu
+
+model:
+  L_layers: 4  # Increased from 2
+
+checkpoint:
+  save_dir: "checkpoints/e4_3_deeper_model"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e4_3_deeper_model"

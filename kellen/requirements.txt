@@ -1,0 +1,23 @@
+# Core dependencies for TPU training
+torch>=2.1.0
+torch-xla[tpu]>=2.1.0
+
+# Data and ML
+numpy>=1.24.0
+omegaconf>=2.3.0
+hydra-core>=1.3.0
+pydantic>=2.0.0
+
+# Logging and monitoring
+tensorboard>=2.14.0
+wandb  # Optional
+
+# GCS support
+google-cloud-storage>=2.10.0
+
+# Optimizer
+adam-atan2
+
+# Utilities
+tqdm>=4.65.0
+pyyaml>=6.0

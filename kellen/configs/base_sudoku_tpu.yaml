@@ -1,19 +1,18 @@
-# Base configuration for Sudoku experiments on TPU v4-32
-# This config replicates the paper's settings scaled for TPU infrastructure
+# Base configuration for Sudoku experiments on TPU v4-64 (stable-1)
 
 # TPU Infrastructure Configuration
 tpu:
-  project: "your-gcp-project-id"  # CHANGE THIS
-  zone: "us-central2-b"  # TRC-allowed zone, verify your zone
-  tpu_name: "kellen-trm-v4-32"
-  accelerator_type: "v4-32"  # 32 chips, 8 workers
+  project: "your-gcp-project-id"
+  zone: "us-central2-b"
+  tpu_name: "stable-1"
+  accelerator_type: "v4-64"  # 32 chips, 64 cores, 8 workers
   num_workers: 8
 
 # Data Configuration
 data:
-  # GCS path to dataset
-  dataset_path: "gs://your-bucket-name/data/sudoku-extreme-1k-aug-1000"  # CHANGE THIS
-  local_cache_dir: "/tmp/sudoku_data"  # Local SSD cache on TPU VM
+  # Local path on stable-1 (persistent node, no GCS needed)
+  dataset_path: "/tmp/data/sudoku-extreme-1k-aug-1000"
+  local_cache_dir: "/tmp/data/sudoku-extreme-1k-aug-1000"
 
   # DataLoader settings
   num_workers: 8  # CPU threads per TPU worker
@@ -23,14 +22,14 @@ data:
 # Model Configuration (Paper: Table 1, Sudoku-Extreme)
 model:
   # Architecture
-  name: "TinyRecursiveReasoningModel_ACTV1"
+  name: "recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1"
 
   # Recursion config (paper: T=3, n=6 for Sudoku)
   H_cycles: 3  # T in paper (high-level cycles)
   L_cycles: 6  # n in paper (latent updates per high-level cycle)
 
   # Layer config
-  H_layers: 0  # Not used in TRM (kept for compatibility)
+  H_layers: 0  # Not used in TRM
   L_layers: 2  # Number of transformer/MLP layers
 
   # Model dimensions
@@ -54,6 +53,12 @@ model:
   # Training precision
   forward_dtype: "bfloat16"  # Use bfloat16 (TPU v4 optimized)
 
+# Loss Configuration
+loss:
+  name: "losses@ACTLossHead"
+  params:
+    loss_type: "stablemax_cross_entropy"
+
 # Training Configuration
 training:
   # Batch size
@@ -66,43 +71,43 @@ training:
   eval_interval: 5000  # Evaluate every N epochs
   checkpoint_interval: 2500  # Save checkpoint every N steps (~30 min)
 
-  # Optimizer (AdamATan2 or AdamW)
+  # Optimizer
   optimizer: "AdamATan2"
   lr: 4e-4  # Scaled from paper's 1e-4 for batch_size 1024
   lr_min_ratio: 1.0  # No decay (constant LR after warmup)
   lr_warmup_steps: 5000  # Linear warmup steps
   weight_decay: 1.0  # Paper uses 1.0 for Sudoku
-  puzzle_emb_weight_decay: 1.0  # Weight decay for puzzle embeddings
-  beta1: 0.9  # Adam beta1
-  beta2: 0.95  # Adam beta2
+  puzzle_emb_weight_decay: 1.0
+  beta1: 0.9
+  beta2: 0.95
 
   # Exponential Moving Average (critical!)
   ema: true
-  ema_rate: 0.999  # Paper uses 0.999
+  ema_rate: 0.999
 
   # Random seed
   seed: 42
 
-  # Gradient clipping (optional, add if training unstable)
-  grad_clip_norm: null  # Set to 1.0 if needed
+  # Gradient clipping (optional)
+  grad_clip_norm: null
 
-# Checkpoint Configuration
+# Checkpoint Configuration (local storage on stable-1)
 checkpoint:
-  bucket: "your-bucket-name"  # CHANGE THIS
-  save_dir: "checkpoints/sudoku_baseline"  # Path within bucket
-  keep_last_n: 5  # Keep last N checkpoints
-  load_from: null  # Path to checkpoint to resume from (e.g., "checkpoints/sudoku_baseline/checkpoint_step_10000.pt")
+  bucket: "stable-1"  # Local storage identifier
+  save_dir: "/tmp/checkpoints/sudoku_baseline"
+  keep_last_n: 5
+  load_from: null
 
-# Logging Configuration
+# Logging Configuration (local storage)
 logging:
   use_tensorboard: true
-  log_interval: 100  # Log every N steps
-  xla_metrics_interval: 1000  # Log XLA metrics every N steps
-  tensorboard_dir: "gs://your-bucket-name/logs/sudoku_baseline"  # CHANGE THIS
+  log_interval: 100
+  xla_metrics_interval: 1000
+  tensorboard_dir: "/tmp/logs/sudoku_baseline"
 
 # Evaluation Configuration
 evaluation:
   enabled: true
-  eval_set: "test"  # Which split to evaluate on
-  eval_batch_size: 256  # Batch size for evaluation
-  save_outputs: false  # Save predictions (for analysis)
+  eval_set: "test"
+  eval_batch_size: 256
+  save_outputs: false
