@@ -1,0 +1,24 @@
+# Experiment E3.1: Model Scaling - Large
+# Test larger model (3× parameters)
+
+defaults:
+  - ../base_sudoku_tpu
+
+model:
+  L_layers: 4  # Increased from 2
+  hidden_size: 1024  # Increased from 512
+  num_heads: 16  # Increased from 8
+
+# Use larger batch size to leverage more compute
+training:
+  global_batch_size: 2048  # 256 per worker
+  per_worker_batch_size: 256
+  lr: 8e-4  # Scaled accordingly
+
+checkpoint:
+  save_dir: "checkpoints/e3_1_large_model"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e3_1_large_model"
+
+# Expected: Check if larger model overfits or improves

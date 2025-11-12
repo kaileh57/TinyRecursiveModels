@@ -1,0 +1,18 @@
+# Experiment E2.2: T/n Schedule - Baseline (T=3, n=6)
+# This is the paper's baseline setting
+# Should match E1.1 results
+
+defaults:
+  - ../base_sudoku_tpu
+
+model:
+  H_cycles: 3  # Paper's value
+  L_cycles: 6  # Paper's value
+
+checkpoint:
+  save_dir: "checkpoints/e2_2_t3_n6_baseline"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e2_2_t3_n6_baseline"
+
+# Expected: ~87% accuracy

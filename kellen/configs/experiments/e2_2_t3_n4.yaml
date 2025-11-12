@@ -1,0 +1,15 @@
+# Experiment E2.2: T/n Schedule - Medium Latent (T=3, n=4)
+# Paper's T but less latent recursion
+
+defaults:
+  - ../base_sudoku_tpu
+
+model:
+  H_cycles: 3  # Paper's value
+  L_cycles: 4  # Reduced from 6
+
+checkpoint:
+  save_dir: "checkpoints/e2_2_t3_n4"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e2_2_t3_n4"

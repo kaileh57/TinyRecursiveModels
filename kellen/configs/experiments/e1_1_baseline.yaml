@@ -1,0 +1,21 @@
+# Experiment E1.1: Baseline Replication
+# Goal: Match paper's 87.4% Sudoku-Extreme accuracy on TPU
+# Conservative batch size for initial validation
+
+defaults:
+  - ../base_sudoku_tpu
+
+# Start with smaller batch size to match paper more closely
+training:
+  global_batch_size: 256  # 32 per worker (paper uses ~32-128)
+  per_worker_batch_size: 32
+  lr: 1e-4  # No scaling, use paper's LR directly
+  lr_warmup_steps: 2000  # Match paper
+
+checkpoint:
+  save_dir: "checkpoints/e1_1_baseline"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e1_1_baseline"
+
+# Expected result: ~87% accuracy after 50K epochs

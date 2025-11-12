@@ -1,0 +1,17 @@
+# Experiment E2.3: MLP vs Attention (ATTENTION)
+# Test full attention architecture (paper shows MLP wins on 9×9)
+
+defaults:
+  - ../base_sudoku_tpu
+
+model:
+  mlp_t: false  # Use attention instead of MLP
+  pos_encodings: "rope"  # Attention benefits from positional encodings
+
+checkpoint:
+  save_dir: "checkpoints/e2_3_attention"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e2_3_attention"
+
+# Expected: Lower accuracy than MLP on 9×9 Sudoku (per paper)

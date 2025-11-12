@@ -1,0 +1,15 @@
+# Experiment E2.2: T/n Schedule - More Latent Recursion (T=2, n=6)
+# Keep n=6 but reduce T=2
+
+defaults:
+  - ../base_sudoku_tpu
+
+model:
+  H_cycles: 2  # Reduced from 3
+  L_cycles: 6  # Keep paper's value
+
+checkpoint:
+  save_dir: "checkpoints/e2_2_t2_n6"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e2_2_t2_n6"

@@ -1,0 +1,16 @@
+# Experiment E2.4: Deep Supervision Ablation (Nsup=8)
+# Test with half the supervision steps
+
+defaults:
+  - ../base_sudoku_tpu
+
+model:
+  halt_max_steps: 8  # Reduced from 16
+
+checkpoint:
+  save_dir: "checkpoints/e2_4_nsup_8"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e2_4_nsup_8"
+
+# Expected: Faster but potentially lower accuracy

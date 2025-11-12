@@ -1,0 +1,18 @@
+# Experiment E2.1: EMA Ablation (EMA OFF)
+# Test impact of disabling EMA
+# Paper shows EMA is critical for generalization
+
+defaults:
+  - ../base_sudoku_tpu
+
+# Disable EMA
+training:
+  ema: false
+
+checkpoint:
+  save_dir: "checkpoints/e2_1_ema_off"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e2_1_ema_off"
+
+# Expected: Significant drop in accuracy vs baseline

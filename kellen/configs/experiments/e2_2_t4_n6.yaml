@@ -1,0 +1,17 @@
+# Experiment E2.2: T/n Schedule - Deeper (T=4, n=6)
+# Test if more high-level cycles improve accuracy
+
+defaults:
+  - ../base_sudoku_tpu
+
+model:
+  H_cycles: 4  # Increased from 3
+  L_cycles: 6  # Paper's value
+
+checkpoint:
+  save_dir: "checkpoints/e2_2_t4_n6"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e2_2_t4_n6"
+
+# Expected: Possible improvement but slower training

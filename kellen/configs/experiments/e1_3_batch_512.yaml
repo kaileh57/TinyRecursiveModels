@@ -1,0 +1,17 @@
+# Experiment E1.3: Batch Size Scaling - 512
+# Test 2× batch size with linear LR scaling
+
+defaults:
+  - ../base_sudoku_tpu
+
+training:
+  global_batch_size: 512  # 64 per worker
+  per_worker_batch_size: 64
+  lr: 2e-4  # Scaled 2× from baseline
+  lr_warmup_steps: 3000  # Slightly longer warmup
+
+checkpoint:
+  save_dir: "checkpoints/e1_3_batch_512"
+
+logging:
+  tensorboard_dir: "gs://your-bucket-name/logs/e1_3_batch_512"
