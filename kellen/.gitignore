@@ -1,0 +1,36 @@
+# Ignore generated files and outputs
+checkpoints/
+logs/
+analysis/data/
+analysis/plots/
+analysis/reports/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Ignore Jupyter notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Ignore temporary files
+*.tmp
+*.log
+*.swp
+*.swo
+*~
+
+# Ignore WandB local files
+wandb/
+
+# Ignore Hydra outputs
+outputs/
+multirun/
+
+# Keep structure directories
+!checkpoints/.gitkeep
+!logs/.gitkeep
+!analysis/.gitkeep

@@ -1,0 +1,596 @@
+================================================================================
+DETAILED EXPERIMENT SPECIFICATIONS
+================================================================================
+
+BASELINE CONFIGURATION (reference for all experiments)
+================================================================================
+Dataset: Sudoku-Extreme
+  - Training: 1000 puzzles × 1000 augmentations
+  - Test: 423K puzzles (no augmentation)
+
+Model: TRM
+  - L_layers: 2
+  - H_cycles: 3
+  - L_cycles: 6
+  - hidden_size: 512
+  - num_heads: 8
+  - expansion: 4
+  - mlp_t: True (MLP variant, not attention)
+  - pos_encodings: none
+  - forward_dtype: bfloat16
+
+Training:
+  - epochs: 50000
+  - global_batch_size: 6144 (768 per worker × 8)
+  - lr: 1e-4
+  - lr_min_ratio: 1.0 (constant LR, no decay)
+  - lr_warmup_steps: 2000
+  - weight_decay: 1.0
+  - beta1: 0.9
+  - beta2: 0.95
+  - ema: True
+  - ema_rate: 0.999
+  - halt_max_steps: 16
+  - halt_exploration_prob: 0.1
+
+Evaluation:
+  - eval_interval: 5000 epochs
+  - checkpoint_every_eval: True
+
+Target Accuracy: ~87% (paper reports 87.4%)
+
+================================================================================
+EXPERIMENT 1: MODEL SIZE SCALING
+================================================================================
+ID: exp01_model_scaling
+Goal: Find optimal hidden size for accuracy vs efficiency
+
+Configs:
+  exp01a: hidden_size=256,  num_heads=4,  ~1.8M params
+  exp01b: hidden_size=384,  num_heads=6,  ~4.0M params
+  exp01c: hidden_size=512,  num_heads=8,  ~7.1M params  [BASELINE]
+  exp01d: hidden_size=768,  num_heads=8,  ~16M params
+  exp01e: hidden_size=1024, num_heads=8,  ~28M params
+  exp01f: hidden_size=1536, num_heads=8,  ~64M params
+
+Fixed: All other baseline params
+Varies: hidden_size, num_heads, puzzle_emb_ndim=${hidden_size}
+
+Metrics:
+  - Test accuracy (primary)
+  - Parameter count
+  - Training throughput (examples/sec)
+  - Memory per worker (GB)
+  - Time to 80% accuracy (convergence speed)
+
+Analysis:
+  - Plot accuracy vs params (log scale)
+  - Identify accuracy saturation point
+  - Compute efficiency metric: accuracy / (params × training_time)
+  - Fit scaling law: accuracy = a - b × params^(-c)
+
+Expected Result: Accuracy improves with size up to 512-768, then plateaus
+
+Runtime: 6 configs × 40 hours = 240 hours (~10 days on v4-64)
+
+================================================================================
+EXPERIMENT 2A: L_CYCLES SCALING
+================================================================================
+ID: exp02a_lcycles_scaling
+Goal: Find optimal number of latent recursion steps
+
+Configs:
+  exp02a_01: L_cycles=2,  effective_depth=6
+  exp02a_02: L_cycles=4,  effective_depth=12
+  exp02a_03: L_cycles=6,  effective_depth=18  [BASELINE]
+  exp02a_04: L_cycles=8,  effective_depth=24
+  exp02a_05: L_cycles=10, effective_depth=30
+  exp02a_06: L_cycles=12, effective_depth=36
+
+Fixed: H_cycles=3, L_layers=2, hidden_size=512
+Varies: L_cycles
+
+Metrics:
+  - Test accuracy
+  - Training time per epoch
+  - Overfitting gap (train acc - test acc)
+
+Analysis:
+  - Plot accuracy vs effective_depth
+  - Identify diminishing returns point
+  - Measure overfitting onset
+
+Expected Result: Optimal around L_cycles=6-8; higher causes overfitting
+
+Runtime: 6 configs × 40 hours = 240 hours
+
+================================================================================
+EXPERIMENT 2B: H_CYCLES SCALING
+================================================================================
+ID: exp02b_hcycles_scaling
+Goal: Find optimal number of high-level reasoning cycles
+
+Configs:
+  exp02b_01: H_cycles=1, effective_depth=6
+  exp02b_02: H_cycles=2, effective_depth=12
+  exp02b_03: H_cycles=3, effective_depth=18  [BASELINE]
+  exp02b_04: H_cycles=4, effective_depth=24
+  exp02b_05: H_cycles=5, effective_depth=30
+
+Fixed: L_cycles=6, L_layers=2, hidden_size=512
+Varies: H_cycles
+
+Metrics: Same as 2A
+
+Analysis:
+  - Compare H_cycles vs L_cycles for same effective depth
+  - Determine if H_cycles or L_cycles is more important
+
+Expected Result: H_cycles=3-4 optimal; higher is slower with no gain
+
+Runtime: 5 configs × 40 hours = 200 hours
+
+================================================================================
+EXPERIMENT 3: DEPTH VS RECURSION TRADEOFF
+================================================================================
+ID: exp03_depth_vs_recursion
+Goal: Test if recursion can substitute for layer depth
+
+Configs (matched for similar param count ~7M):
+  exp03a: L_layers=1, L_cycles=12, H_cycles=3
+  exp03b: L_layers=2, L_cycles=6,  H_cycles=3  [BASELINE]
+  exp03c: L_layers=3, L_cycles=4,  H_cycles=3
+  exp03d: L_layers=4, L_cycles=3,  H_cycles=3
+  exp03e: L_layers=6, L_cycles=2,  H_cycles=3
+
+Fixed: hidden_size=512, effective_depth ≈ 18-24 (via L_layers × L_cycles)
+Varies: L_layers, L_cycles (inversely)
+
+Metrics:
+  - Test accuracy
+  - Training throughput (examples/sec)
+  - Inference speed (puzzles/sec)
+  - Memory usage
+
+Analysis:
+  - Which is faster: many layers or many cycles?
+  - Which generalizes better?
+  - Pareto frontier: accuracy vs speed
+
+Expected Result: Shallow + high recursion is faster and generalizes better
+
+Runtime: 5 configs × 40 hours = 200 hours
+
+================================================================================
+EXPERIMENT 4A: TRAINING SET SIZE SCALING
+================================================================================
+ID: exp04a_data_scaling
+Goal: Determine minimum viable dataset size
+
+Configs:
+  exp04a_100:  100 training puzzles  × 1000 aug
+  exp04a_250:  250 training puzzles  × 1000 aug
+  exp04a_500:  500 training puzzles  × 1000 aug
+  exp04a_1k:   1000 training puzzles × 1000 aug  [BASELINE]
+  exp04a_2k:   2000 training puzzles × 1000 aug
+  exp04a_5k:   5000 training puzzles × 1000 aug
+
+Fixed: All baseline params
+Varies: Number of training puzzles (requires new datasets)
+
+Metrics:
+  - Test accuracy
+  - Overfitting (train vs test gap)
+  - Convergence speed
+
+Analysis:
+  - Scaling law: accuracy = a - b × N^(-c)
+  - Find minimum N for 85% accuracy
+
+Expected Result: 500-1000 puzzles sufficient; more doesn't help much
+
+Runtime: 6 configs × 40 hours = 240 hours
+         + dataset generation time (~1 hour per dataset)
+
+================================================================================
+EXPERIMENT 4B: AUGMENTATION SCALING
+================================================================================
+ID: exp04b_augmentation_scaling
+Goal: Find optimal augmentation factor
+
+Configs:
+  exp04b_010:  1000 puzzles × 10 aug
+  exp04b_100:  1000 puzzles × 100 aug
+  exp04b_500:  1000 puzzles × 500 aug
+  exp04b_1k:   1000 puzzles × 1000 aug  [BASELINE]
+  exp04b_2k:   1000 puzzles × 2000 aug
+
+Fixed: 1000 training puzzles
+Varies: Augmentation factor
+
+Metrics:
+  - Test accuracy
+  - Training diversity
+  - Data loading speed
+
+Analysis:
+  - Diminishing returns from augmentation
+  - Compare to exp04a: is augmentation a substitute for data?
+
+Expected Result: 500-1000 augmentations optimal
+
+Runtime: 5 configs × 40 hours = 200 hours
+
+================================================================================
+EXPERIMENT 5: SUPERVISION STEPS (HALT_MAX_STEPS) SCALING
+================================================================================
+ID: exp05_supervision_scaling
+Goal: Optimize inference budget vs accuracy
+
+Configs:
+  exp05a: halt_max_steps=4
+  exp05b: halt_max_steps=8
+  exp05c: halt_max_steps=12
+  exp05d: halt_max_steps=16  [BASELINE]
+  exp05e: halt_max_steps=24
+  exp05f: halt_max_steps=32
+
+Fixed: All baseline params
+Varies: halt_max_steps
+
+Metrics:
+  - Test accuracy
+  - Average halt steps (from ACT)
+  - Training throughput
+  - Inference throughput
+
+Analysis:
+  - Accuracy vs inference cost tradeoff
+  - Does model learn to halt early?
+  - Pareto frontier: accuracy vs halt_steps
+
+Expected Result: 12-16 steps optimal; higher wastes compute
+
+Runtime: 6 configs × 40 hours = 240 hours
+
+================================================================================
+EXPERIMENT 6: BATCH SIZE SCALING
+================================================================================
+ID: exp06_batch_scaling
+Goal: Find optimal batch size for TPU v4-64
+
+Configs:
+  exp06a: global_batch_size=1536  (192 per worker)
+  exp06b: global_batch_size=3072  (384 per worker)
+  exp06c: global_batch_size=6144  (768 per worker)  [BASELINE]
+  exp06d: global_batch_size=12288 (1536 per worker)
+  exp06e: global_batch_size=24576 (3072 per worker)
+  exp06f: global_batch_size=49152 (6144 per worker)
+
+Fixed: All baseline params
+Varies: global_batch_size
+Note: Scale LR proportionally (lr = 1e-4 × sqrt(batch / 6144))
+
+Metrics:
+  - Test accuracy
+  - Training throughput (examples/sec)
+  - Memory usage per worker
+  - Gradient noise scale
+
+Analysis:
+  - Critical batch size (accuracy starts dropping)
+  - Linear scaling regime (throughput ∝ batch size)
+  - Optimal batch for max throughput without hurting accuracy
+
+Expected Result: Can scale to 24K+ without accuracy loss on TPU
+
+Runtime: 6 configs × variable time (larger batch = faster)
+         ≈ 180 hours total
+
+================================================================================
+EXPERIMENT 7: MIXED PRECISION COMPARISON
+================================================================================
+ID: exp07_precision_comparison
+Goal: Validate bfloat16 vs other precisions
+
+Configs:
+  exp07a: forward_dtype=float32
+  exp07b: forward_dtype=bfloat16  [BASELINE]
+  exp07c: forward_dtype=float16
+
+Fixed: All baseline params
+Varies: forward_dtype
+
+Metrics:
+  - Test accuracy
+  - Numerical stability (gradient norms, loss variance)
+  - Training speed (steps/sec)
+  - Memory usage
+
+Analysis:
+  - Precision requirements for TRM
+  - Speed/memory gains from reduced precision
+  - Stability issues with float16
+
+Expected Result: bfloat16 optimal (fast, stable, accurate)
+
+Runtime: 3 configs × 40 hours = 120 hours
+
+================================================================================
+EXPERIMENT 8: EMA ABLATION
+================================================================================
+ID: exp08_ema_ablation
+Goal: Optimize EMA configuration
+
+Configs:
+  exp08a: ema=False
+  exp08b: ema=True, ema_rate=0.99
+  exp08c: ema=True, ema_rate=0.995
+  exp08d: ema=True, ema_rate=0.999   [BASELINE]
+  exp08e: ema=True, ema_rate=0.9995
+
+Fixed: All baseline params
+Varies: ema, ema_rate
+
+Metrics:
+  - Test accuracy (with and without EMA)
+  - Training stability (loss smoothness)
+  - EMA overhead (time per step)
+
+Analysis:
+  - Impact of EMA on final accuracy
+  - Optimal EMA rate
+  - Compare train-time model vs EMA model
+
+Expected Result: ema=True, ema_rate=0.999 is critical for best accuracy
+
+Runtime: 5 configs × 40 hours = 200 hours
+
+================================================================================
+EXPERIMENT 9: OPTIMIZER COMPARISON
+================================================================================
+ID: exp09_optimizer_comparison
+Goal: Compare optimizers for TRM
+
+Configs:
+  exp09a: AdamATan2, beta1=0.9, beta2=0.95  [BASELINE]
+  exp09b: AdamW, beta1=0.9, beta2=0.95
+  exp09c: AdamW, beta1=0.9, beta2=0.99
+  exp09d: AdamW, beta1=0.9, beta2=0.999
+  exp09e: Lion, beta1=0.9, beta2=0.99
+
+Fixed: All baseline params
+Varies: optimizer, beta1, beta2
+
+Metrics:
+  - Test accuracy
+  - Convergence speed (epochs to 85%)
+  - Training stability
+
+Analysis:
+  - Which optimizer converges fastest?
+  - Which achieves best final accuracy?
+  - Sensitivity to beta2
+
+Expected Result: AdamATan2 is best (paper's choice)
+
+Runtime: 5 configs × 40 hours = 200 hours
+
+================================================================================
+EXPERIMENT 10: LEARNING RATE SCHEDULE
+================================================================================
+ID: exp10_lr_schedule
+Goal: Optimize learning rate and schedule
+
+Configs:
+  exp10a: lr=3e-5, lr_min_ratio=1.0 (constant)
+  exp10b: lr=1e-4, lr_min_ratio=1.0 (constant)  [BASELINE]
+  exp10c: lr=3e-4, lr_min_ratio=1.0 (constant)
+  exp10d: lr=1e-4, lr_min_ratio=0.1 (cosine decay)
+  exp10e: lr=1e-4, lr_min_ratio=0.01 (strong decay)
+
+Fixed: All baseline params
+Varies: lr, lr_min_ratio
+
+Metrics:
+  - Test accuracy
+  - Final learning rate
+  - Training curve stability
+
+Analysis:
+  - Optimal LR for TRM
+  - Benefits of LR decay vs constant
+  - Overfitting with high LR
+
+Expected Result: Constant LR at 1e-4 is robust and simple
+
+Runtime: 5 configs × 40 hours = 200 hours
+
+================================================================================
+NOVEL CONTRIBUTIONS
+================================================================================
+
+CONTRIBUTION 1: CURRICULUM RECURSION
+------------------------------------
+ID: contrib01_curriculum
+Goal: Improve convergence with curriculum on recursion depth
+
+Implementation:
+  - Start with L_cycles=2, H_cycles=1
+  - Linearly increase to L_cycles=6, H_cycles=3 over first 10K epochs
+  - Continue training until 50K epochs
+
+Baseline Comparison: Fixed L_cycles=6, H_cycles=3
+
+Hypothesis: Curriculum prevents early overfitting and speeds convergence
+
+Metrics:
+  - Convergence speed (epochs to 85%)
+  - Final test accuracy
+  - Training stability (loss variance)
+
+Expected Result: Faster convergence, similar final accuracy
+
+Runtime: 2 configs (curriculum vs baseline) × 40 hours = 80 hours
+
+CONTRIBUTION 2: ADAPTIVE HALTING EXPLORATION
+---------------------------------------------
+ID: contrib02_adaptive_halt
+Goal: Improve efficiency with adaptive halt exploration
+
+Implementation:
+  - Start with halt_exploration_prob=0.3 (high exploration)
+  - Anneal to halt_exploration_prob=0.05 over 50K epochs
+  - Track halt step distribution
+
+Baseline Comparison: Fixed halt_exploration_prob=0.1
+
+Hypothesis: Early exploration helps learning, late exploitation reduces waste
+
+Metrics:
+  - Test accuracy
+  - Average halt steps at inference
+  - Halt step variance
+
+Expected Result: Same accuracy, 20-30% fewer inference steps
+
+Runtime: 2 configs × 40 hours = 80 hours
+
+CONTRIBUTION 3: GRADIENT CHECKPOINTING FOR DEEP RECURSION
+----------------------------------------------------------
+ID: contrib03_gradient_checkpoint
+Goal: Enable deeper recursion with same memory
+
+Implementation:
+  - Apply torch.utils.checkpoint.checkpoint to L_level forward
+  - Test with L_cycles=24 (vs baseline L_cycles=6)
+  - Measure memory savings
+
+Baseline Comparison: L_cycles=6 without checkpointing
+
+Hypothesis: Checkpointing enables 4× deeper recursion with ~same memory
+
+Metrics:
+  - Max achievable L_cycles without OOM
+  - Memory usage (GB per worker)
+  - Training speed (overhead from recomputation)
+  - Test accuracy with deeper recursion
+
+Expected Result: 3-4× deeper recursion, 1.5× slower, better accuracy
+
+Runtime: 3 configs (depths 6, 12, 24) × 40 hours = 120 hours
+
+CONTRIBUTION 4: REGULARIZED RECURSION (CYCLE CONSISTENCY)
+----------------------------------------------------------
+ID: contrib04_regularized_recursion
+Goal: Encourage stable, convergent reasoning
+
+Implementation:
+  - Add L2 penalty on ||z_H(t+1) - z_H(t)||^2 across H_cycles
+  - Weight λ ∈ {0.01, 0.1, 1.0}
+  - Encourage small updates per cycle
+
+Baseline Comparison: No cycle consistency loss
+
+Hypothesis: Regularization improves generalization and interpretability
+
+Metrics:
+  - Test accuracy
+  - Cycle update norms
+  - Convergence stability
+
+Expected Result: Slight accuracy gain, more stable reasoning trajectories
+
+Runtime: 4 configs (λ ∈ {0, 0.01, 0.1, 1.0}) × 40 hours = 160 hours
+
+CONTRIBUTION 5: SPARSE ATTENTION FOR LARGE GRIDS
+-------------------------------------------------
+ID: contrib05_sparse_attention
+Goal: Scale TRM to larger puzzles (50×50 grids)
+
+Implementation:
+  - Replace full attention with local + global pattern
+  - Local: 7×7 window around each cell
+  - Global: Attend to puzzle embedding tokens
+  - Test on Maze-50×50 (custom dataset)
+
+Baseline Comparison: Full attention (doesn't fit in memory for 50×50)
+
+Hypothesis: Sparse attention enables scaling with minimal accuracy loss
+
+Metrics:
+  - Accuracy on Maze-30×30 (compare to full attention)
+  - Accuracy on Maze-50×50 (novel capability)
+  - Memory usage
+  - Training speed
+
+Expected Result: Enable 50×50 grids, 90%+ of full attention accuracy on 30×30
+
+Runtime: 2 configs × 3 datasets (Sudoku, Maze-30, Maze-50)
+         ≈ 240 hours + dataset generation
+
+CONTRIBUTION 6: MULTI-TASK RECURSIVE LEARNING
+----------------------------------------------
+ID: contrib06_multitask
+Goal: Improve generalization via multi-task training
+
+Implementation:
+  - Joint training on Sudoku + Maze with task embeddings
+  - Separate puzzle_emb for each task
+  - Shared L_level and H_level reasoning modules
+
+Baseline Comparison: Single-task models (Sudoku-only, Maze-only)
+
+Hypothesis: Shared recursive reasoning transfers across tasks
+
+Metrics:
+  - Sudoku accuracy (multi-task vs single-task)
+  - Maze accuracy (multi-task vs single-task)
+  - Transfer learning: freeze recursion, fine-tune task head
+
+Expected Result: Multi-task model matches single-task on both benchmarks
+
+Runtime: 3 configs (Sudoku-only, Maze-only, Multi-task)
+         × 60 hours (longer training for multi-task)
+         = 180 hours
+
+================================================================================
+TOTAL RUNTIME ESTIMATE
+================================================================================
+
+Core Experiments:
+  Exp 01: 240 hours
+  Exp 02a: 240 hours
+  Exp 02b: 200 hours
+  Exp 03: 200 hours
+  Exp 04a: 240 hours
+  Exp 04b: 200 hours
+  Exp 05: 240 hours
+  Exp 06: 180 hours
+  Exp 07: 120 hours
+  Exp 08: 200 hours
+  Exp 09: 200 hours
+  Exp 10: 200 hours
+  Subtotal: 2460 hours (~103 days on single v4-64)
+
+Novel Contributions:
+  Contrib 01: 80 hours
+  Contrib 02: 80 hours
+  Contrib 03: 120 hours
+  Contrib 04: 160 hours
+  Contrib 05: 240 hours
+  Contrib 06: 180 hours
+  Subtotal: 860 hours (~36 days)
+
+TOTAL: 3320 hours (~138 days single-threaded)
+
+With Parallelization (assuming 4 experiments run concurrently):
+  Total calendar time: ~35 days
+
+With Prioritization (run top 5 experiments + 2 contributions):
+  Selected total: ~1200 hours (~50 days, or ~13 days with 4 parallel)
+
+RECOMMENDATION: Start with Experiments 1, 2, 3, 5, 6 and Contributions 1, 2
+                Total: ~1400 hours (~15 days with 4 parallel on v4-64)
+
+================================================================================

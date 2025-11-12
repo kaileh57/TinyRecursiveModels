@@ -1,0 +1,268 @@
+================================================================================
+TRM SCALING RESEARCH - MASTER PLAN
+================================================================================
+Goal: Systematically explore scaling properties of Tiny Recursive Models (TRM)
+      on TPU v4-64 infrastructure (32 chips, 64 cores, 8 workers)
+
+Target Infrastructure:
+- Node: stable-1 (persistent)
+- Hardware: TPU v4-64 (2 cores per chip = 64 total cores across 32 chips)
+- Distribution: 8 workers (JAX/PyTorch distributed pattern)
+- Framework: PyTorch + PyTorch/XLA for TPU
+
+================================================================================
+PHASE 1: BASELINE REPLICATION
+================================================================================
+Replicate paper's core results on Sudoku-Extreme to validate setup:
+- Target: ~87% accuracy (paper's MLP variant)
+- Dataset: 1K training puzzles, 1000 augmentations, 423K test
+- Model: 2 layers, H_cycles=3, L_cycles=6, hidden_size=512
+- Training: 50K epochs, lr=1e-4, weight_decay=1.0, EMA=0.999
+- Key configs: MLP-T variant (attention-free), no position encodings
+
+Success criteria: Within 2-3% of paper's reported accuracy
+
+================================================================================
+PHASE 2: SCALING EXPERIMENTS
+================================================================================
+
+EXPERIMENT 1: Model Size Scaling
+--------------------------------
+Hypothesis: TRM's efficiency holds across model sizes; optimal size exists
+Variables: hidden_size ∈ {256, 384, 512, 768, 1024, 1536}
+Fixed: L_layers=2, H_cycles=3, L_cycles=6
+Metrics: Accuracy, training speed, parameter count, memory usage
+Analysis: Accuracy vs params curve, efficiency frontier
+
+EXPERIMENT 2: Depth Scaling (Recursive Cycles)
+-----------------------------------------------
+Hypothesis: Deeper recursion improves reasoning up to diminishing returns
+Variables:
+  - L_cycles ∈ {2, 4, 6, 8, 10, 12}
+  - H_cycles ∈ {1, 2, 3, 4, 5}
+Fixed: hidden_size=512, L_layers=2
+Metrics: Accuracy vs effective depth (H_cycles * L_cycles)
+Analysis: Optimal recursion budget, overfitting threshold
+
+EXPERIMENT 3: Layer Count vs Recursion Trade-off
+-------------------------------------------------
+Hypothesis: Recursion can substitute for layer depth
+Variables:
+  - (L_layers=1, L_cycles=12) vs (L_layers=2, L_cycles=6) vs
+    (L_layers=3, L_cycles=4) vs (L_layers=4, L_cycles=3)
+Fixed: hidden_size=512, H_cycles=3, total param budget ~constant
+Metrics: Accuracy, training time, inference speed
+Analysis: Which is more efficient: deep networks or deep recursion?
+
+EXPERIMENT 4: Data Scaling
+---------------------------
+Hypothesis: TRM generalizes with less data than expected
+Variables: Training set size ∈ {100, 250, 500, 1000, 2500, 5000}
+Variables: Augmentation factor ∈ {10, 100, 500, 1000, 2000}
+Fixed: Model architecture (baseline)
+Metrics: Accuracy vs training examples, overfitting analysis
+Analysis: Minimum viable dataset, augmentation saturation point
+
+EXPERIMENT 5: Supervision Steps (Nsup) Scaling
+-----------------------------------------------
+Hypothesis: Fewer supervision steps may suffice with proper scheduling
+Variables: halt_max_steps ∈ {4, 8, 12, 16, 24, 32}
+Fixed: Baseline architecture
+Metrics: Accuracy, training throughput, convergence speed
+Analysis: Optimal supervision budget, cost-accuracy tradeoff
+
+EXPERIMENT 6: Batch Size Scaling
+---------------------------------
+Hypothesis: TPU v4 enables massive batch sizes; find optimal point
+Variables: global_batch_size ∈ {192, 384, 768, 1536, 3072, 6144}
+Fixed: Baseline architecture, learning rate scaled appropriately
+Metrics: Accuracy, training stability, memory usage, throughput
+Analysis: Linear scaling regime, critical batch size
+
+EXPERIMENT 7: Mixed Precision & Dtype
+--------------------------------------
+Hypothesis: bfloat16 is optimal; explore float32 and float16
+Variables: forward_dtype ∈ {float32, bfloat16, float16}
+Fixed: Baseline architecture
+Metrics: Accuracy, numerical stability, training speed, memory
+Analysis: Precision requirements for TRM stability
+
+EXPERIMENT 8: EMA Rate Ablation
+--------------------------------
+Hypothesis: EMA is critical; rate matters
+Variables: ema_rate ∈ {0.99, 0.995, 0.999, 0.9995}, ema ∈ {True, False}
+Fixed: Baseline architecture
+Metrics: Accuracy, training stability
+Analysis: Optimal EMA configuration
+
+EXPERIMENT 9: Optimizer Comparison
+-----------------------------------
+Hypothesis: AdamATan2 vs standard optimizers
+Variables: optimizer ∈ {AdamATan2, Adam, AdamW, Lion}
+Variables: (beta1, beta2) ∈ {(0.9, 0.95), (0.9, 0.99), (0.9, 0.999)}
+Fixed: Baseline architecture
+Metrics: Convergence speed, final accuracy, stability
+Analysis: Best optimizer for TRM
+
+EXPERIMENT 10: Learning Rate Scaling
+-------------------------------------
+Hypothesis: Optimal LR scales with batch size and model size
+Variables: lr ∈ {3e-5, 1e-4, 3e-4, 1e-3} × sqrt(batch_size/768)
+Variables: lr_schedule ∈ {cosine, linear, constant}
+Fixed: Baseline architecture
+Metrics: Training curves, final accuracy
+Analysis: LR scaling laws for TRM
+
+================================================================================
+PHASE 3: CROSS-DOMAIN VALIDATION
+================================================================================
+Test best configurations from Phase 2 on:
+- Maze-Hard (30×30)
+- ARC-AGI-1 subset (if time permits)
+
+Hypothesis: Scaling insights transfer across puzzle domains
+
+================================================================================
+PHASE 4: NOVEL CONTRIBUTIONS
+================================================================================
+
+CONTRIBUTION 1: Curriculum Recursion
+-------------------------------------
+Idea: Start with shallow recursion, progressively deepen
+Implementation: Schedule L_cycles from 2→6 over training
+Baseline: Fixed L_cycles=6 throughout
+Metrics: Convergence speed, final accuracy, training stability
+
+CONTRIBUTION 2: Dynamic Halting Thresholds
+-------------------------------------------
+Idea: Adaptive halt_exploration_prob based on training progress
+Implementation: Anneal exploration from 0.3 → 0.05 over training
+Baseline: Fixed halt_exploration_prob=0.1
+Metrics: Inference efficiency, accuracy, halt step distribution
+
+CONTRIBUTION 3: Gradient Checkpoint Recursion
+----------------------------------------------
+Idea: Checkpoint intermediate recursion states to save memory
+Implementation: Selectively checkpoint z_L updates
+Benefit: Enable deeper recursion with same memory budget
+Metrics: Max achievable depth, memory usage, speed
+
+CONTRIBUTION 4: Regularized Recursion
+--------------------------------------
+Idea: Add cycle consistency loss between H_cycles
+Implementation: L2 penalty on z_H changes per cycle
+Hypothesis: Encourages stable, convergent reasoning
+Metrics: Accuracy, reasoning stability, interpretability
+
+CONTRIBUTION 5: Sparse Attention in Recursion
+----------------------------------------------
+Idea: Sparse attention patterns for larger puzzles
+Implementation: Local + global attention in L_level blocks
+Application: Scale to 50×50 grids (Maze-XLarge)
+Metrics: Accuracy on large grids, compute efficiency
+
+CONTRIBUTION 6: Multi-Task Recursive Learning
+----------------------------------------------
+Idea: Train single TRM on mixed puzzle types
+Implementation: Joint training on Sudoku + Maze with task embeddings
+Hypothesis: Shared reasoning improves generalization
+Metrics: Per-task accuracy, transfer learning capability
+
+================================================================================
+EXECUTION STRATEGY
+================================================================================
+
+Week 1: Infrastructure + Baseline
+- Set up TPU distributed training
+- Replicate Sudoku baseline
+- Validate training pipeline
+
+Week 2: Core Scaling Experiments (Exp 1-5)
+- Run model size, depth, layer/recursion tradeoffs
+- Collect comprehensive metrics
+- Initial analysis
+
+Week 3: Training Dynamics (Exp 6-10)
+- Batch size, precision, EMA, optimizer, LR experiments
+- Identify best training recipe
+
+Week 4: Cross-Domain + Novel Contributions
+- Validate on Maze
+- Implement 2-3 novel contributions
+- Final analysis and writeup
+
+================================================================================
+MEASUREMENT & ANALYSIS
+================================================================================
+
+Primary Metrics:
+- Test accuracy (main objective)
+- Training throughput (puzzles/sec)
+- Memory usage (GB per worker)
+- Parameter count
+- Effective compute (FLOPs)
+
+Secondary Metrics:
+- Convergence speed (epochs to 95% of final accuracy)
+- Inference speed (puzzles/sec)
+- Halt step distribution
+- Gradient norms
+- Loss curves
+
+Analysis Framework:
+- Scaling law fits (power law, log-linear)
+- Pareto frontiers (accuracy vs compute, accuracy vs params)
+- Statistical significance tests (t-tests for comparisons)
+- Ablation importance (ANOVA)
+
+================================================================================
+DELIVERABLES
+================================================================================
+
+1. Code Repository
+   - Clean, documented experiment scripts
+   - Reusable config system
+   - Distributed training utilities
+   - Analysis notebooks
+
+2. Experiment Logs
+   - WandB dashboards for all runs
+   - Checkpoints for best models
+   - Raw metrics (CSV/JSON)
+
+3. Research Report
+   - Methodology
+   - Results with plots
+   - Scaling laws derived
+   - Novel contributions
+   - Recommendations
+
+4. Artifacts
+   - Trained models
+   - Predictions on test sets
+   - Scaling law visualizations
+
+================================================================================
+SUCCESS CRITERIA
+================================================================================
+
+Minimum Viable:
+✓ Replicate baseline Sudoku result
+✓ Complete 5+ scaling experiments
+✓ Document all findings
+✓ Code runs reliably on TPU v4-64
+
+Target:
+✓ All 10 scaling experiments complete
+✓ 2+ novel contributions validated
+✓ Cross-domain validation (Maze)
+✓ Publishable-quality analysis
+✓ Scaling laws characterized
+
+Stretch:
+✓ All 6 novel contributions
+✓ ARC-AGI validation
+✓ New SOTA on Sudoku-Extreme
+✓ Transferable insights to other recursive models
+
+================================================================================
