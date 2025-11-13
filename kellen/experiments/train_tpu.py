@@ -314,7 +314,8 @@ def save_train_state(config: PretrainConfig, train_state: TrainState, device):
     if config.checkpoint_path is None:
         return
 
-    os.makedirs(config.checkpoint_path, exist_ok=True)
+    # Check if saving to GCS bucket
+    is_gcs = config.checkpoint_path.startswith("gs://")
 
     # Move model to CPU for saving if on TPU
     if config.use_tpu and TPU_AVAILABLE:
@@ -322,18 +323,46 @@ def save_train_state(config: PretrainConfig, train_state: TrainState, device):
     else:
         state_dict = train_state.model.state_dict()
 
-    checkpoint_file = os.path.join(config.checkpoint_path, f"step_{train_state.step}.pt")
+    # Save to local temp first for speed
+    if is_gcs:
+        local_dir = f"/tmp/checkpoints_{os.getpid()}"
+        os.makedirs(local_dir, exist_ok=True)
+        checkpoint_file = os.path.join(local_dir, f"step_{train_state.step}.pt")
+        metadata_file = os.path.join(local_dir, f"step_{train_state.step}_metadata.json")
+    else:
+        os.makedirs(config.checkpoint_path, exist_ok=True)
+        checkpoint_file = os.path.join(config.checkpoint_path, f"step_{train_state.step}.pt")
+        metadata_file = os.path.join(config.checkpoint_path, f"step_{train_state.step}_metadata.json")
+
+    # Save checkpoint and metadata
     torch.save(state_dict, checkpoint_file)
 
-    # Save training metadata
     metadata = {
         "step": train_state.step,
         "total_steps": train_state.total_steps,
         "config": config.model_dump()
     }
-    metadata_file = os.path.join(config.checkpoint_path, f"step_{train_state.step}_metadata.json")
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
+
+    # If GCS, copy asynchronously (non-blocking)
+    if is_gcs:
+        import subprocess
+        gcs_checkpoint = os.path.join(config.checkpoint_path, f"step_{train_state.step}.pt")
+        gcs_metadata = os.path.join(config.checkpoint_path, f"step_{train_state.step}_metadata.json")
+
+        # Use gsutil -m for parallel multi-threaded transfer
+        print(f"[Rank 0] Uploading checkpoint to {gcs_checkpoint}...")
+        subprocess.Popen(
+            ["gsutil", "-m", "cp", checkpoint_file, gcs_checkpoint],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        subprocess.Popen(
+            ["gsutil", "-m", "cp", metadata_file, gcs_metadata],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
 
 
 def load_checkpoint(model: nn.Module, config: PretrainConfig, device):
@@ -591,15 +620,22 @@ def save_code_and_config(config: PretrainConfig):
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int, use_tpu: bool) -> PretrainConfig:
     """Load and synchronize config across all workers"""
+    import pickle
+
     objects = [None]
     if rank == 0:
         config = PretrainConfig(**hydra_config)
 
-        # Generate names
+        # Generate names deterministically to ensure all workers get same values
         if config.project_name is None:
             config.project_name = f"{os.path.basename(config.data_paths[0]).capitalize()}-TRM-TPU"
         if config.run_name is None:
-            config.run_name = f"{config.arch.name.split('@')[-1]}_{coolname.generate_slug(2)}"
+            # Use deterministic name based on seed instead of random
+            import hashlib
+            seed_str = f"{config.arch.name}_{config.seed}_{config.global_batch_size}_{config.epochs}"
+            seed_hash = hashlib.md5(seed_str.encode()).hexdigest()[:8]
+            arch_name = config.arch.name.split('@')[-1]
+            config.run_name = f"{arch_name}_{seed_hash}"
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("kellen", "checkpoints", config.project_name, config.run_name)
 
@@ -608,22 +644,61 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int, use
     # Broadcast config to all workers
     if world_size > 1:
         if use_tpu and TPU_AVAILABLE:
-            # XLA broadcast
-            # Note: xm.mesh_reduce doesn't work for objects, so we'll use a different approach
-            # Save to a temp file and load on all workers
+            # Use proper XLA broadcast via network (works across separate VMs)
+            device = xm.xla_device()
+
             if rank == 0:
-                temp_config_path = "/tmp/temp_config.yaml"
-                with open(temp_config_path, 'w') as f:
-                    yaml.dump(objects[0].model_dump(), f)
-            # Barrier to ensure file is written
-            xm.rendezvous("config_save")
+                # Serialize config to bytes
+                config_bytes = pickle.dumps(objects[0].model_dump())
+                config_size = len(config_bytes)
+                print(f"[Rank {rank}] Broadcasting config ({config_size} bytes) to all workers...")
+            else:
+                config_size = 0
+
+            # Broadcast config size to all ranks
+            size_tensor = torch.tensor([config_size], dtype=torch.int64, device=device)
+            size_tensor = xm.all_reduce(xm.REDUCE_SUM, [size_tensor])[0]
+            xm.mark_step()
+
+            actual_size = size_tensor.item()
+
+            # Broadcast config bytes
+            if rank == 0:
+                # Convert bytes to tensor
+                config_tensor = torch.ByteTensor(list(config_bytes)).to(device)
+                # Pad to ensure consistent size
+                if len(config_tensor) < actual_size:
+                    padding = torch.zeros(actual_size - len(config_tensor), dtype=torch.uint8, device=device)
+                    config_tensor = torch.cat([config_tensor, padding])
+            else:
+                # Allocate tensor to receive config
+                config_tensor = torch.zeros(actual_size, dtype=torch.uint8, device=device)
+
+            # All-reduce acts as broadcast since only rank 0 has non-zero values
+            config_tensor = xm.all_reduce(xm.REDUCE_SUM, [config_tensor])[0]
+            xm.mark_step()
+
+            # Ensure all workers have finished broadcast
+            xm.rendezvous("config_broadcast_complete")
+
             if rank != 0:
-                temp_config_path = "/tmp/temp_config.yaml"
-                with open(temp_config_path, 'r') as f:
-                    config_dict = yaml.safe_load(f)
+                # Deserialize config
+                config_bytes = bytes(config_tensor.cpu().numpy()[:actual_size])
+                config_dict = pickle.loads(config_bytes)
                 objects = [PretrainConfig(**config_dict)]
+                print(f"[Rank {rank}] Config received successfully")
         else:
+            # Standard PyTorch distributed
             dist.broadcast_object_list(objects, src=0)
+
+    # Validate all workers have identical config
+    if world_size > 1 and use_tpu and TPU_AVAILABLE and rank == 0:
+        import hashlib
+        config_str = str(sorted(objects[0].model_dump().items()))
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()
+        print(f"[Rank {rank}] Config hash: {config_hash[:16]}...")
+        print(f"[Rank {rank}] Project: {objects[0].project_name}")
+        print(f"[Rank {rank}] Run: {objects[0].run_name}")
 
     return objects[0]
 
