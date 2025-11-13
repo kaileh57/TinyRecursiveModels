@@ -314,7 +314,8 @@ def save_train_state(config: PretrainConfig, train_state: TrainState, device):
     if config.checkpoint_path is None:
         return
 
-    os.makedirs(config.checkpoint_path, exist_ok=True)
+    # Check if saving to GCS bucket
+    is_gcs = config.checkpoint_path.startswith("gs://")
 
     # Move model to CPU for saving if on TPU
     if config.use_tpu and TPU_AVAILABLE:
@@ -322,18 +323,46 @@ def save_train_state(config: PretrainConfig, train_state: TrainState, device):
     else:
         state_dict = train_state.model.state_dict()
 
-    checkpoint_file = os.path.join(config.checkpoint_path, f"step_{train_state.step}.pt")
+    # Save to local temp first for speed
+    if is_gcs:
+        local_dir = f"/tmp/checkpoints_{os.getpid()}"
+        os.makedirs(local_dir, exist_ok=True)
+        checkpoint_file = os.path.join(local_dir, f"step_{train_state.step}.pt")
+        metadata_file = os.path.join(local_dir, f"step_{train_state.step}_metadata.json")
+    else:
+        os.makedirs(config.checkpoint_path, exist_ok=True)
+        checkpoint_file = os.path.join(config.checkpoint_path, f"step_{train_state.step}.pt")
+        metadata_file = os.path.join(config.checkpoint_path, f"step_{train_state.step}_metadata.json")
+
+    # Save checkpoint and metadata
     torch.save(state_dict, checkpoint_file)
 
-    # Save training metadata
     metadata = {
         "step": train_state.step,
         "total_steps": train_state.total_steps,
         "config": config.model_dump()
     }
-    metadata_file = os.path.join(config.checkpoint_path, f"step_{train_state.step}_metadata.json")
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
+
+    # If GCS, copy asynchronously (non-blocking)
+    if is_gcs:
+        import subprocess
+        gcs_checkpoint = os.path.join(config.checkpoint_path, f"step_{train_state.step}.pt")
+        gcs_metadata = os.path.join(config.checkpoint_path, f"step_{train_state.step}_metadata.json")
+
+        # Use gsutil -m for parallel multi-threaded transfer
+        print(f"[Rank 0] Uploading checkpoint to {gcs_checkpoint}...")
+        subprocess.Popen(
+            ["gsutil", "-m", "cp", checkpoint_file, gcs_checkpoint],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        subprocess.Popen(
+            ["gsutil", "-m", "cp", metadata_file, gcs_metadata],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
 
 
 def load_checkpoint(model: nn.Module, config: PretrainConfig, device):
@@ -622,8 +651,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int, use
                 # Serialize config to bytes
                 config_bytes = pickle.dumps(objects[0].model_dump())
                 config_size = len(config_bytes)
-                if rank == 0:
-                    print(f"[Rank {rank}] Broadcasting config ({config_size} bytes) to all workers...")
+                print(f"[Rank {rank}] Broadcasting config ({config_size} bytes) to all workers...")
             else:
                 config_size = 0
 
@@ -650,13 +678,15 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int, use
             config_tensor = xm.all_reduce(xm.REDUCE_SUM, [config_tensor])[0]
             xm.mark_step()
 
+            # Ensure all workers have finished broadcast
+            xm.rendezvous("config_broadcast_complete")
+
             if rank != 0:
                 # Deserialize config
                 config_bytes = bytes(config_tensor.cpu().numpy()[:actual_size])
                 config_dict = pickle.loads(config_bytes)
                 objects = [PretrainConfig(**config_dict)]
-                if rank == 0:
-                    print(f"[Rank {rank}] Config received successfully")
+                print(f"[Rank {rank}] Config received successfully")
         else:
             # Standard PyTorch distributed
             dist.broadcast_object_list(objects, src=0)
