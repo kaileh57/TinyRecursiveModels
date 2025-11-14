@@ -1,5 +1,12 @@
-torch
-adam-atan2
+# JAX and Flax for TPU support
+jax[tpu]>=0.4.20
+jaxlib>=0.4.20
+flax>=0.8.0
+optax>=0.1.7
+orbax-checkpoint>=0.4.0
+chex>=0.1.8
+
+# Core dependencies
 einops
 tqdm
 coolname
@@ -9,12 +16,10 @@ wandb
 omegaconf
 hydra-core
 huggingface_hub
-packaging 
-ninja 
-wheel 
-setuptools 
-setuptools-scm
+packaging
+wheel
+setuptools
 pydantic-core
-huggingface_hub 
-numba
-triton
+
+# Utilities
+numpy
