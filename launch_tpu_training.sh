@@ -20,7 +20,7 @@ EXPERIMENT="${1:-baseline}"
 TPU_NAME="${2:-${TPU_NAME:-stable-1}}"
 ZONE="${3:-${ZONE:-us-central2-b}}"
 NUM_WORKERS=8
-PROJECT_DIR="${PROJECT_DIR:-~/TinyRecursiveModels}"
+PROJECT_DIR="${HOME}/TinyRecursiveModels"
 
 # Colors for output
 RED='\033[0;31m'

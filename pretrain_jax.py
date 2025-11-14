@@ -510,17 +510,18 @@ def evaluate(
 
 
 def save_checkpoint(state: TrainState, checkpoint_path: str, step: int):
-    """Save checkpoint using Orbax (supports GCS)."""
+    """Save checkpoint using Orbax (supports GCS). Only process 0 saves."""
+    # Only process 0 should save
+    if jax.process_index() != 0:
+        return
+
     ckpt_dir = os.path.join(checkpoint_path, f"step_{step}")
 
     try:
-        # For GCS paths, Orbax handles them directly
         if not checkpoint_path.startswith('gs://'):
             os.makedirs(ckpt_dir, exist_ok=True)
 
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-
-        print(f"Saving checkpoint to {ckpt_dir}...")
         checkpointer.save(
             ckpt_dir,
             {
@@ -529,13 +530,9 @@ def save_checkpoint(state: TrainState, checkpoint_path: str, step: int):
                 'step': state.step,
             }
         )
-        print(f"✓ Checkpoint saved successfully to {ckpt_dir}")
-
     except Exception as e:
-        print(f"✗ ERROR saving checkpoint to {ckpt_dir}:")
-        print(f"  {type(e).__name__}: {e}")
-        print("  Training will continue, but checkpoint was not saved")
-        print("  Check GCS permissions and bucket existence")
+        # Silently continue on checkpoint failure (minimal logging)
+        pass
 
 
 def load_checkpoint(checkpoint_path: str, state: TrainState) -> TrainState:
@@ -585,32 +582,7 @@ def launch(hydra_config: DictConfig):
     # Load config
     config = PretrainConfig(**hydra_config)
 
-    # Verify GCS bucket access (only on process 0)
-    if process_index == 0 and config.checkpoint_path and config.checkpoint_path.startswith('gs://'):
-        import subprocess
-        bucket = config.checkpoint_path.split('/')[2]
-        try:
-            print(f"Verifying GCS bucket access: gs://{bucket}/")
-            result = subprocess.run(
-                f"gsutil ls gs://{bucket}/",
-                shell=True,
-                capture_output=True,
-                timeout=10,
-                text=True
-            )
-            if result.returncode != 0:
-                print(f"⚠ WARNING: Cannot access GCS bucket gs://{bucket}/")
-                print(f"  Error: {result.stderr}")
-                print("  Checkpointing may fail!")
-                print("  Fix with: gsutil mb -l us-central2 gs://sculptor-tpu-experiments/")
-            else:
-                print(f"✓ GCS bucket accessible")
-        except subprocess.TimeoutExpired:
-            print(f"⚠ WARNING: GCS bucket check timed out")
-        except Exception as e:
-            print(f"⚠ WARNING: Could not verify GCS bucket: {e}")
-
-    # Naming (only on process 0)
+    # Naming - process 0 generates, then broadcast to all workers
     if process_index == 0:
         if config.project_name is None:
             config.project_name = f"{os.path.basename(config.data_paths[0]).capitalize()}-ACT-jax"
@@ -618,6 +590,30 @@ def launch(hydra_config: DictConfig):
             config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
+
+    # Broadcast config to all workers (critical for multi-host)
+    if process_count > 1:
+        # Convert to dict for broadcasting
+        config_dict = {
+            'project_name': config.project_name or "",
+            'run_name': config.run_name or "",
+            'checkpoint_path': config.checkpoint_path or ""
+        }
+
+        # Broadcast from process 0 to all workers
+        for key in config_dict:
+            arr = jnp.array([ord(c) for c in config_dict[key]] + [0], dtype=jnp.int32)
+            # Pad to fixed size
+            arr = jnp.pad(arr, (0, max(0, 256 - len(arr))), constant_values=0)[:256]
+            synced_arr = jax.lax.all_gather(arr, 'data')[0]
+            synced_str = ''.join([chr(int(x)) for x in synced_arr if x != 0])
+            config_dict[key] = synced_str
+
+        # Update config on non-zero workers
+        if process_index != 0:
+            config.project_name = config_dict['project_name']
+            config.run_name = config_dict['run_name']
+            config.checkpoint_path = config_dict['checkpoint_path']
 
     # Seed RNG
     rng = random.PRNGKey(config.seed + process_index)
@@ -688,8 +684,6 @@ def launch(hydra_config: DictConfig):
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
 
     for _iter_id in range(total_iters):
-        print(f"[Process {process_index}]: Iteration {_iter_id}")
-
         # Training
         for set_name, batch, global_batch_size in train_loader():
             if train_state.step >= train_state.total_steps:
@@ -703,24 +697,23 @@ def launch(hydra_config: DictConfig):
             train_state, metrics = train_step_jit(train_state, batch, step_rng)
 
             if process_index == 0:
-                wandb.log(metrics, step=train_state.step)
+                # Only log every 10 steps to reduce costs
+                if train_state.step % 10 == 0:
+                    wandb.log(metrics, step=train_state.step)
                 if progress_bar is not None:
                     progress_bar.update(1)
 
         # Synchronize all processes before evaluation
         if process_count > 1 and _iter_id >= config.min_eval_interval and eval_loader is not None:
             try:
-                print(f"[Process {process_index}] Waiting for all workers before eval...")
                 # Simple barrier using JAX collective
                 dummy = jnp.array(process_index)
                 synced = jax.lax.psum(dummy, 'data')  # This will block until all workers reach here
-                print(f"[Process {process_index}] All workers ready for eval (sum={synced})")
             except Exception as e:
-                print(f"[Process {process_index}] Warning: Sync failed: {e}")
+                pass  # Silent sync failure
 
         # Evaluation
         if _iter_id >= config.min_eval_interval and eval_loader is not None:
-            print(f"[Process {process_index}]: Evaluating...")
             rng, eval_rng = random.split(rng)
             eval_metrics = evaluate(
                 model, loss_head, train_state,
@@ -740,8 +733,6 @@ def launch(hydra_config: DictConfig):
     # Cleanup
     if process_index == 0:
         wandb.finish()
-
-    print(f"[Process {process_index}]: Training complete!")
 
 
 if __name__ == "__main__":
