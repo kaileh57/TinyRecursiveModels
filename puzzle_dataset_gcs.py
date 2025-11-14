@@ -32,7 +32,7 @@ class GCSDatasetCache:
 
         # Create cache directory if it doesn't exist
         os.makedirs(self.cache_dir, exist_ok=True)
-        print(f"[Worker {process_index}] Cache directory: {self.cache_dir}")
+        print(f"[W{process_index}] Cache: {self.cache_dir}")
 
     def get_local_path(self, dataset_path: str, split: str) -> str:
         """
@@ -57,11 +57,10 @@ class GCSDatasetCache:
         # Check if already cached
         cache_marker = os.path.join(local_path, f".{split}_cached")
         if os.path.exists(cache_marker):
-            print(f"[Worker {self.process_index}] Using cached dataset: {local_path}")
             return local_path
 
         # Download from GCS
-        print(f"[Worker {self.process_index}] Downloading {dataset_path}/{split}/ to {local_path}/{split}/")
+        print(f"[W{self.process_index}] Downloading {dataset_name}...")
         start_time = time.time()
 
         try:
@@ -91,9 +90,6 @@ class GCSDatasetCache:
             # Create cache marker to indicate successful download
             with open(cache_marker, 'w') as f:
                 f.write(f"Cached at {time.time()}\n")
-
-            elapsed = time.time() - start_time
-            print(f"[Worker {self.process_index}] Download complete in {elapsed:.1f}s")
 
         except subprocess.TimeoutExpired:
             raise RuntimeError(
@@ -140,7 +136,6 @@ def create_dataloader_with_gcs(config, split: str, rank: int = 0, world_size: in
     for path in dataset_paths:
         local_path = cache.get_local_path(path, split)
         local_dataset_paths.append(local_path)
-        print(f"[Worker {rank}] Mapped {path} -> {local_path}")
 
     # Create dataset with local paths
     dataset = PuzzleDataset(
