@@ -1,6 +1,3 @@
-# Auto-generated experiment configuration
-# DO NOT EDIT MANUALLY - regenerate with generate_experiment_configs.py
-
 defaults:
 - arch_config: exp02a_05_arch
 - _self_
@@ -30,6 +27,6 @@ freeze_weights: false
 seed: 0
 project_name: TRM-Exp02a-LCyclesScaling
 run_name: exp02a_05_lcycles10
-checkpoint_path: null
+checkpoint_path: gs://sculptor-tpu-experiments/checkpoints/exp02a-l-cycles/exp02a_05
 load_checkpoint: null
 eval_save_outputs: []

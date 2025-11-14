@@ -572,6 +572,12 @@ def load_checkpoint(checkpoint_path: str, state: TrainState) -> TrainState:
 def launch(hydra_config: DictConfig):
     """Main training loop."""
     # Initialize JAX distributed
+    # For TPU v4-64 with 8 workers, JAX auto-detects multi-host setup from TPU environment
+    # If running fails with multi-host errors, you can manually specify:
+    # coordinator_address = os.environ.get('TPU_COORDINATOR_ADDRESS', 'localhost:8476')
+    # num_processes = int(os.environ.get('TPU_WORKER_COUNT', 1))
+    # process_id = int(os.environ.get('TPU_WORKER_ID', 0))
+    # jax.distributed.initialize(coordinator_address, num_processes, process_id)
     jax.distributed.initialize()
 
     # Get process info

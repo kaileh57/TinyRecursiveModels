@@ -1,6 +1,3 @@
-# Auto-generated experiment configuration
-# DO NOT EDIT MANUALLY - regenerate with generate_experiment_configs.py
-
 defaults:
 - arch_config: exp07a_arch
 - _self_
@@ -30,6 +27,6 @@ freeze_weights: false
 seed: 0
 project_name: TRM-Exp07-PrecisionComparison
 run_name: exp07a_float32
-checkpoint_path: null
+checkpoint_path: gs://sculptor-tpu-experiments/checkpoints/exp07-precision/exp07a
 load_checkpoint: null
 eval_save_outputs: []

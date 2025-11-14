@@ -1,6 +1,3 @@
-# Auto-generated experiment configuration
-# DO NOT EDIT MANUALLY - regenerate with generate_experiment_configs.py
-
 defaults:
 - arch_config: contrib02_adaptive_arch
 - _self_
@@ -30,7 +27,7 @@ freeze_weights: false
 seed: 0
 project_name: TRM-Contrib02-AdaptiveHalt
 run_name: contrib02_adaptive
-checkpoint_path: null
+checkpoint_path: gs://sculptor-tpu-experiments/checkpoints/contrib02-adaptive-halting/contrib02_adaptive
 load_checkpoint: null
 eval_save_outputs: []
 use_adaptive_halting: true

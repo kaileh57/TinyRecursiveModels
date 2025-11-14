@@ -7,8 +7,8 @@ Goal: Systematically explore scaling properties of Tiny Recursive Models (TRM)
 Target Infrastructure:
 - Node: stable-1 (persistent)
 - Hardware: TPU v4-64 (2 cores per chip = 64 total cores across 32 chips)
-- Distribution: 8 workers (JAX/PyTorch distributed pattern)
-- Framework: PyTorch + PyTorch/XLA for TPU
+- Distribution: 8 workers (JAX multi-host distributed)
+- Framework: JAX + Flax for TPU v4-64
 
 ================================================================================
 PHASE 1: BASELINE REPLICATION

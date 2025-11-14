@@ -1,6 +1,3 @@
-# Auto-generated experiment configuration
-# DO NOT EDIT MANUALLY - regenerate with generate_experiment_configs.py
-
 defaults:
 - arch_config: exp05_a_arch
 - _self_
@@ -30,6 +27,6 @@ freeze_weights: false
 seed: 0
 project_name: TRM-Exp05-SupervisionScaling
 run_name: exp05_a_halt4
-checkpoint_path: null
+checkpoint_path: gs://sculptor-tpu-experiments/checkpoints/exp05-supervision-steps/exp05_a
 load_checkpoint: null
 eval_save_outputs: []
