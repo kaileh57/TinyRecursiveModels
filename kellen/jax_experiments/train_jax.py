@@ -21,17 +21,19 @@ from flax.training import train_state, checkpoints, orbax_utils
 from flax import struct
 import optax
 import numpy as np
+from orbax.checkpoint import PyTreeCheckpointer, CheckpointManagerOptions, CheckpointManager
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel
 import wandb
-import tqdm
+from tqdm import tqdm
 
 from jax_models.recursive_reasoning.trm import (
     TinyRecursiveReasoningModel, TRMConfig, OuterCarry
 )
 from jax_models.losses import cross_entropy_loss, compute_accuracy, halt_loss
+from jax_models.data_pipeline import create_data_iterator
 
 
 # Check for TPU
@@ -40,10 +42,11 @@ TPU_AVAILABLE = jax.devices()[0].platform == 'tpu'
 
 @struct.dataclass
 class TrainState(train_state.TrainState):
-    """Extended train state with carry and step tracking"""
+    """Extended train state with carry, EMA, and step tracking"""
     carry: OuterCarry
     global_step: int
     rng: jax.Array
+    ema_params: Any = None  # EMA parameters (optional)
 
 
 class PretrainConfig(BaseModel):
@@ -249,6 +252,88 @@ def train_step(
     return state, metrics
 
 
+def update_ema(ema_params: Any, new_params: Any, decay: float = 0.999) -> Any:
+    """Update EMA parameters"""
+    if ema_params is None:
+        return new_params
+    return jax.tree_map(
+        lambda ema, new: decay * ema + (1 - decay) * new,
+        ema_params,
+        new_params
+    )
+
+
+@partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(3,))
+def eval_step(
+    state: TrainState,
+    batch: Dict[str, jnp.ndarray],
+    labels: jnp.ndarray,
+    config_dict: Dict[str, Any]
+) -> Dict[str, float]:
+    """Single evaluation step with pmap"""
+
+    # Use EMA params if available
+    params = state.ema_params if state.ema_params is not None else state.params
+
+    # Forward pass
+    new_carry, outputs = state.apply_fn(
+        {'params': params},
+        state.carry,
+        batch,
+        training=False,
+        rngs={'carry': state.rng, 'exploration': state.rng}
+    )
+
+    # Compute metrics
+    lm_loss = cross_entropy_loss(outputs['logits'], labels)
+    acc = compute_accuracy(outputs['logits'], labels)
+
+    metrics = {
+        'eval_loss': lm_loss,
+        'eval_accuracy': acc,
+    }
+
+    # Average metrics across devices
+    metrics = jax.lax.pmean(metrics, axis_name='batch')
+
+    return metrics
+
+
+def save_checkpoint(state: TrainState, checkpoint_path: str, step: int, keep: int = 5):
+    """Save checkpoint using Orbax"""
+    # Unreplicate state (take from first device)
+    state = jax.tree_map(lambda x: x[0] if hasattr(x, '__getitem__') else x, state)
+
+    # Create checkpoint manager
+    options = CheckpointManagerOptions(max_to_keep=keep, create=True)
+    checkpointer = PyTreeCheckpointer()
+
+    manager = CheckpointManager(
+        checkpoint_path,
+        checkpointer,
+        options
+    )
+
+    # Save
+    manager.save(step, state)
+    manager.wait_until_finished()
+
+
+def load_checkpoint(checkpoint_path: str, state: TrainState) -> Tuple[TrainState, int]:
+    """Load checkpoint using Orbax"""
+    checkpointer = PyTreeCheckpointer()
+    manager = CheckpointManager(checkpoint_path, checkpointer)
+
+    # Get latest step
+    latest_step = manager.latest_step()
+    if latest_step is None:
+        return state, 0
+
+    # Restore
+    restored = manager.restore(latest_step, state)
+    return restored, latest_step
+
+
 def load_synced_config(hydra_config: DictConfig, rank: int) -> PretrainConfig:
     """Load and sync config across all processes"""
     if rank == 0:
@@ -321,13 +406,60 @@ def main(hydra_config: DictConfig):
     # Set random seed
     rng = jax.random.PRNGKey(config.seed + rank)
 
+    # Create data iterators
+    if rank == 0:
+        print("Creating data iterators...")
+
+    train_dataset = create_data_iterator(
+        data_paths=config.data_paths,
+        global_batch_size=config.global_batch_size,
+        rank=rank,
+        num_replicas=world_size,
+        seed=config.seed,
+        epochs_per_iter=1,
+        test_set_mode=False,
+        split="train"
+    )
+
+    # Get steps per epoch for learning rate scheduling
+    steps_per_epoch = train_dataset.get_steps_per_epoch()
+
+    if rank == 0:
+        print(f"Steps per epoch: {steps_per_epoch}")
+
+    # Create test dataset if specified
+    test_dataset = None
+    if config.data_paths_test:
+        test_dataset = create_data_iterator(
+            data_paths=config.data_paths_test,
+            global_batch_size=config.global_batch_size,
+            rank=rank,
+            num_replicas=world_size,
+            seed=config.seed,
+            epochs_per_iter=1,
+            test_set_mode=True,
+            split="test"
+        )
+
     # Create learning rate schedule
-    # TODO: Implement data loading to get steps_per_epoch
-    steps_per_epoch = 1000  # Placeholder
     lr_schedule = create_learning_rate_schedule(config, steps_per_epoch)
 
     # Create training state
     state = create_train_state(config, rng, lr_schedule)
+
+    # Initialize EMA
+    if config.ema:
+        state = state.replace(ema_params=state.params)
+
+    # Load checkpoint if specified
+    if config.load_checkpoint and os.path.exists(config.load_checkpoint):
+        if rank == 0:
+            print(f"Loading checkpoint from {config.load_checkpoint}")
+        state, start_step = load_checkpoint(config.load_checkpoint, state)
+        if rank == 0:
+            print(f"Resumed from step {start_step}")
+    else:
+        start_step = 0
 
     # Replicate state across devices
     state = jax.device_put_replicated(state, jax.local_devices())
@@ -345,12 +477,114 @@ def main(hydra_config: DictConfig):
         os.makedirs(config.checkpoint_path, exist_ok=True)
 
         print("Training started!")
+        print(f"Total epochs: {config.epochs}")
+        print(f"Global batch size: {config.global_batch_size}")
+        print(f"Devices: {jax.device_count()}")
 
     # Training loop
-    # TODO: Implement data loading and full training loop
-    # For now, this is a skeleton showing the structure
+    global_step = start_step
+    config_dict = {"halt_max_steps": config.arch.get("halt_max_steps", 1)}
 
+    for epoch in range(config.epochs):
+        if rank == 0:
+            print(f"\n=== Epoch {epoch + 1}/{config.epochs} ===")
+
+        # Training iteration
+        train_metrics_accum = []
+        pbar = tqdm(train_dataset, desc=f"Epoch {epoch + 1}", disable=(rank != 0))
+
+        for set_name, batch, effective_batch_size in pbar:
+            # Prepare batch for pmap (reshape to [num_devices, batch_per_device, ...])
+            num_local_devices = jax.local_device_count()
+            batch_per_device = batch["inputs"].shape[0] // num_local_devices
+
+            batch_inputs = batch["inputs"].reshape(num_local_devices, batch_per_device, -1)
+            batch_labels = batch["labels"].reshape(num_local_devices, batch_per_device, -1)
+            batch_puzzle_ids = batch["puzzle_identifiers"].reshape(num_local_devices, batch_per_device)
+
+            pmap_batch = {
+                "inputs": batch_inputs,
+                "puzzle_identifiers": batch_puzzle_ids
+            }
+
+            # Training step
+            state, metrics = train_step(state, pmap_batch, batch_labels, config_dict)
+
+            # Update EMA (on first device only, then replicate)
+            if config.ema:
+                unreplicated_state = jax.tree_map(lambda x: x[0], state)
+                new_ema_params = update_ema(
+                    unreplicated_state.ema_params,
+                    unreplicated_state.params,
+                    decay=config.ema_rate
+                )
+                unreplicated_state = unreplicated_state.replace(ema_params=new_ema_params)
+                state = jax.device_put_replicated(unreplicated_state, jax.local_devices())
+
+            # Collect metrics (from first device)
+            metrics_host = jax.tree_map(lambda x: float(x[0]), metrics)
+            train_metrics_accum.append(metrics_host)
+
+            global_step += 1
+
+            # Log to wandb
+            if rank == 0 and global_step % 10 == 0:
+                wandb.log(metrics_host, step=global_step)
+                pbar.set_postfix({
+                    'loss': f"{metrics_host['loss']:.4f}",
+                    'acc': f"{metrics_host['accuracy']:.3f}"
+                })
+
+            # Save checkpoint
+            if global_step % config.save_checkpoint_steps == 0 and rank == 0:
+                print(f"\nSaving checkpoint at step {global_step}")
+                save_checkpoint(state, config.checkpoint_path, global_step)
+
+            # Evaluation
+            if test_dataset is not None and global_step % config.eval_interval == 0:
+                if rank == 0:
+                    print(f"\n=== Evaluation at step {global_step} ===")
+
+                eval_metrics_accum = []
+                for eval_set_name, eval_batch, eval_effective_size in test_dataset:
+                    # Prepare batch for pmap
+                    eval_batch_inputs = eval_batch["inputs"].reshape(num_local_devices, batch_per_device, -1)
+                    eval_batch_labels = eval_batch["labels"].reshape(num_local_devices, batch_per_device, -1)
+                    eval_batch_puzzle_ids = eval_batch["puzzle_identifiers"].reshape(num_local_devices, batch_per_device)
+
+                    pmap_eval_batch = {
+                        "inputs": eval_batch_inputs,
+                        "puzzle_identifiers": eval_batch_puzzle_ids
+                    }
+
+                    # Evaluation step
+                    eval_metrics = eval_step(state, pmap_eval_batch, eval_batch_labels, config_dict)
+                    eval_metrics_host = jax.tree_map(lambda x: float(x[0]), eval_metrics)
+                    eval_metrics_accum.append(eval_metrics_host)
+
+                # Average evaluation metrics
+                if eval_metrics_accum and rank == 0:
+                    avg_eval_metrics = {
+                        k: np.mean([m[k] for m in eval_metrics_accum])
+                        for k in eval_metrics_accum[0].keys()
+                    }
+                    wandb.log(avg_eval_metrics, step=global_step)
+                    print(f"Eval Loss: {avg_eval_metrics['eval_loss']:.4f}, "
+                          f"Eval Acc: {avg_eval_metrics['eval_accuracy']:.3f}")
+
+        # End of epoch logging
+        if rank == 0 and train_metrics_accum:
+            avg_train_metrics = {
+                k: np.mean([m[k] for m in train_metrics_accum])
+                for k in train_metrics_accum[0].keys()
+            }
+            print(f"Epoch {epoch + 1} - Train Loss: {avg_train_metrics['loss']:.4f}, "
+                  f"Train Acc: {avg_train_metrics['accuracy']:.3f}")
+
+    # Final checkpoint
     if rank == 0:
+        print("\nSaving final checkpoint...")
+        save_checkpoint(state, config.checkpoint_path, global_step)
         print("Training complete!")
         wandb.finish()
 
