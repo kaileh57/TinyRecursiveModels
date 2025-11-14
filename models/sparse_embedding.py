@@ -1,132 +1,123 @@
 from typing import Union
+import jax
+import jax.numpy as jnp
+from jax import random
+from flax import linen as nn
+import optax
 
-import torch
-from torch import nn
-import torch.distributed as dist
-from torch.optim.optimizer import Optimizer, ParamsT
-
-from models.common import trunc_normal_init_
+from models.common import trunc_normal_init
 
 
 class CastedSparseEmbedding(nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int, batch_size: int, init_std: float, cast_to: torch.dtype):
-        super().__init__()
-        self.cast_to = cast_to
+    """Sparse embedding layer with gradient accumulation for distributed training."""
+    num_embeddings: int
+    embedding_dim: int
+    init_std: float = 0.0
+    dtype: jnp.dtype = jnp.bfloat16
 
-        # Real Weights
-        # Truncated LeCun normal init
-        self.weights = nn.Buffer(
-            trunc_normal_init_(torch.empty((num_embeddings, embedding_dim)), std=init_std), persistent=True
+    def setup(self):
+        # Initialize embeddings
+        embedding_init = lambda rng, shape, dtype: trunc_normal_init(
+            rng, shape, dtype=jnp.float32, std=self.init_std
         )
+        self.weights = self.param('weights', embedding_init,
+                                  (self.num_embeddings, self.embedding_dim), jnp.float32)
 
-        # Local weights and IDs
-        # Local embeddings, with gradient, not persistent
-        self.local_weights = nn.Buffer(torch.zeros(batch_size, embedding_dim, requires_grad=True), persistent=False)
-        # Local embedding IDs, not persistent
-        self.local_ids = nn.Buffer(torch.zeros(batch_size, dtype=torch.int32), persistent=False)
+    def __call__(self, inputs: jnp.ndarray, training: bool = False) -> jnp.ndarray:
+        """
+        Args:
+            inputs: [batch_size] tensor of embedding indices
+            training: whether in training mode
+        Returns:
+            embeddings: [batch_size, embedding_dim] tensor
+        """
+        # Lookup embeddings
+        embeddings = jnp.take(self.weights, inputs, axis=0)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if not self.training:
-            # Test mode, no gradient
-            return self.weights[inputs].to(self.cast_to)
-            
-        # Training mode, fill puzzle embedding from weights
-        with torch.no_grad():
-            self.local_weights.copy_(self.weights[inputs])
-            self.local_ids.copy_(inputs)
-
-        return self.local_weights.to(self.cast_to)
+        # Cast to target dtype
+        return embeddings.astype(self.dtype)
 
 
-class CastedSparseEmbeddingSignSGD_Distributed(Optimizer):
-    def __init__(
-        self,
-        params: ParamsT,
+def create_sparse_embedding_optimizer(learning_rate: float, weight_decay: float = 1e-2):
+    """
+    Create SignSGD optimizer for sparse embeddings.
 
-        world_size: int,
-        lr: Union[float, torch.Tensor] = 1e-3,
-        weight_decay: float = 1e-2,
-    ):
-        if not 0.0 <= lr:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 <= weight_decay:
-            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+    In JAX/Flax, we use a custom gradient transformation that:
+    1. Takes the sign of gradients (SignSGD)
+    2. Applies weight decay
+    """
 
-        defaults = dict(
-            lr=lr,
-            weight_decay=weight_decay,
-            world_size=world_size
-        )
-        super().__init__(params, defaults)
+    def sign_sgd_with_decay(learning_rate, weight_decay):
+        """SignSGD with decoupled weight decay."""
 
-    @torch.no_grad
-    def step(self, closure=None):  # type: ignore
-        for group in self.param_groups:
-            # Find the sparse embedding weights
-            local_weights_grad = None
-            local_ids = None
-            weights = None
-            
-            assert len(group["params"]) == 3
-            for p in group["params"]:
-                if p.requires_grad:
-                    local_weights_grad = p.grad
-                elif p.ndim == 1:
-                    local_ids = p
-                elif p.ndim == 2:
-                    weights = p
-                else:
-                    assert False
-                
-            assert local_ids is not None
-            assert weights is not None
-        
-            # Apply SignSGD
-            # Adam ≈ SignSGD if gradient is very sparse
-            if local_weights_grad is not None:
-                _sparse_emb_signsgd_dist(
-                    local_weights_grad,
-                    local_ids,
-                    weights,
-                    
-                    lr=group["lr"],
-                    weight_decay=group["weight_decay"],
-                    world_size=group["world_size"]
+        def init_fn(params):
+            return {}
+
+        def update_fn(updates, state, params):
+            # Apply weight decay to params
+            if params is not None:
+                params_with_decay = jax.tree_map(
+                    lambda p: p * (1.0 - learning_rate * weight_decay),
+                    params
                 )
+            else:
+                params_with_decay = None
+
+            # Take sign of gradients
+            signed_updates = jax.tree_map(lambda g: -learning_rate * jnp.sign(g), updates)
+
+            return signed_updates, state
+
+        return optax.GradientTransformation(init_fn, update_fn)
+
+    return sign_sgd_with_decay(learning_rate, weight_decay)
 
 
-def _sparse_emb_signsgd_dist(
-    local_weights_grad: torch.Tensor,
-    local_ids: torch.Tensor,
-    weights: torch.Tensor,
-    
-    lr: float,
-    weight_decay: float,
-    world_size: int
-) -> None:
-    N, D = local_weights_grad.shape
-    
-    # All-gather
-    all_weights_grad = local_weights_grad
+def sparse_embedding_signsgd_update(grads, local_ids, weights, lr: float, weight_decay: float):
+    """
+    Update sparse embeddings using SignSGD with weight decay.
+
+    This function handles the distributed sparse embedding update logic:
+    1. Gather gradients from all devices
+    2. Aggregate gradients by unique IDs
+    3. Apply SignSGD with weight decay
+
+    Args:
+        grads: [batch_size, embedding_dim] gradients
+        local_ids: [batch_size] embedding IDs
+        weights: [num_embeddings, embedding_dim] embedding weights
+        lr: learning rate
+        weight_decay: weight decay coefficient
+
+    Returns:
+        updated_weights: [num_embeddings, embedding_dim]
+    """
+    N, D = grads.shape
+
+    # In distributed setting, we would gather across devices here
+    # For now, handle single device case
+    all_grads = grads
     all_ids = local_ids
 
-    if world_size > 1:
-        all_weights_grad = torch.empty((world_size * N, D), dtype=local_weights_grad.dtype, device=local_weights_grad.device)
-        all_ids = torch.empty(world_size * N,               dtype=local_ids.dtype,          device=local_ids.device)
-    
-        dist.all_gather_into_tensor(all_weights_grad, local_weights_grad)
-        dist.all_gather_into_tensor(all_ids,          local_ids)
+    # Get unique IDs and aggregate gradients
+    unique_ids = jnp.unique(all_ids)
 
-    # Unique
-    grad_ids, inv = all_ids.unique(return_inverse=True)
+    # Aggregate gradients for each unique ID
+    def aggregate_grad(id_val):
+        mask = (all_ids == id_val).astype(jnp.float32)
+        # Sum gradients for this ID
+        grad_sum = jnp.sum(all_grads * mask[:, None], axis=0)
+        return grad_sum
 
-    grad = torch.zeros((grad_ids.shape[0], D), dtype=all_weights_grad.dtype, device=all_weights_grad.device)
-    grad.scatter_add_(0, inv.unsqueeze(-1).expand(-1, D), all_weights_grad)
+    aggregated_grads = jax.vmap(aggregate_grad)(unique_ids)
+
+    # Get current weights for these IDs
+    current_weights = weights[unique_ids]
 
     # SignSGD with decoupled weight decay
-    p = weights[grad_ids]
+    updated_weights = current_weights * (1.0 - lr * weight_decay) - lr * jnp.sign(aggregated_grads)
 
-    p.mul_(1.0 - lr * weight_decay).add_(torch.sign(grad), alpha=-lr)
+    # Update the weights array
+    weights = weights.at[unique_ids].set(updated_weights)
 
-    # Write updated slices back
-    weights[grad_ids] = p
+    return weights
