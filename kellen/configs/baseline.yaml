@@ -49,7 +49,7 @@ seed: 0
 # Logging
 project_name: "TRM-Scaling-Research"
 run_name: null  # Auto-generated
-checkpoint_path: null  # Auto-generated
+checkpoint_path: "gs://sculptor-tpu-experiments/checkpoints"  # GCS bucket for TPU v4-64
 load_checkpoint: null
 
 # Evaluation

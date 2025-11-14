@@ -34,6 +34,30 @@ from utils.functions import load_model_class, get_model_source_path
 from models.losses import ACTLossHead
 
 
+def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetadata, data_paths_test: List[str]):
+    """Create evaluators based on config."""
+    evaluators = []
+
+    for eval_cfg in config.evaluators:
+        eval_name = eval_cfg.name
+
+        if eval_name == "ARC":
+            from evaluators.arc import ARC
+            for data_path in data_paths_test:
+                evaluator = ARC(
+                    data_path=data_path,
+                    eval_metadata=eval_metadata,
+                    submission_K=eval_cfg.__pydantic_extra__.get('submission_K', 2),
+                    pass_Ks=eval_cfg.__pydantic_extra__.get('pass_Ks', (1, 2, 5, 10, 100, 1000)),
+                    aggregated_voting=eval_cfg.__pydantic_extra__.get('aggregated_voting', True)
+                )
+                evaluators.append(evaluator)
+        else:
+            print(f"Warning: Unknown evaluator {eval_name}")
+
+    return evaluators
+
+
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
     name: str
@@ -142,6 +166,27 @@ def create_mesh(num_devices: int = None):
     return mesh
 
 
+def shard_batch(batch: Dict[str, jnp.ndarray], mesh: Mesh) -> Dict[str, jnp.ndarray]:
+    """
+    Shard batch across data parallel axis.
+
+    For TPU v4-64, we shard the batch dimension across the 'data' axis.
+    """
+    # Create sharding for batch dimension
+    batch_sharding = NamedSharding(mesh, P('data', None))
+
+    # Shard each tensor in the batch
+    sharded_batch = {}
+    for k, v in batch.items():
+        # Shard along batch dimension (first axis)
+        if v.ndim >= 1:
+            sharded_batch[k] = jax.device_put(v, batch_sharding)
+        else:
+            sharded_batch[k] = v
+
+    return sharded_batch
+
+
 def create_dataloader(config: PretrainConfig, split: str, rank: int = 0, world_size: int = 1, **kwargs):
     """Create a dataloader for the given split."""
     dataset = PuzzleDataset(
@@ -157,12 +202,17 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int = 0, world_s
 
     # Convert to iterator
     def dataloader_iterator():
-        for batch in dataset:
-            # Convert numpy arrays to JAX arrays
-            jax_batch = {k: jnp.array(v) for k, v in batch.items()}
-            yield jax_batch
+        for set_name, batch, global_batch_size in dataset:
+            # Convert to JAX arrays (handles both numpy and torch)
+            jax_batch = {}
+            for k, v in batch.items():
+                if hasattr(v, 'numpy'):  # torch tensor
+                    jax_batch[k] = jnp.array(v.numpy())
+                else:  # already numpy
+                    jax_batch[k] = jnp.array(v)
+            yield set_name, jax_batch, global_batch_size
 
-    return dataloader_iterator(), dataset.metadata
+    return dataloader_iterator, dataset.metadata
 
 
 def create_model_and_loss_head(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rng: random.PRNGKey):
@@ -187,7 +237,7 @@ def create_model_and_loss_head(config: PretrainConfig, train_metadata: PuzzleDat
 
 
 def create_optimizer(config: PretrainConfig, total_steps: int, use_sparse_emb: bool = True):
-    """Create optimizer with learning rate schedule."""
+    """Create optimizer with learning rate schedule and sparse embedding support."""
 
     def cosine_schedule_with_warmup(step):
         """Cosine learning rate schedule with warmup."""
@@ -199,15 +249,44 @@ def create_optimizer(config: PretrainConfig, total_steps: int, use_sparse_emb: b
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return config.lr_min_ratio + max(0.0, (1 - config.lr_min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-    # Create learning rate schedule
+    # Create learning rate schedules
     lr_schedule = lambda step: config.lr * cosine_schedule_with_warmup(step)
+    sparse_lr_schedule = lambda step: config.puzzle_emb_lr * cosine_schedule_with_warmup(step)
 
     # Create optimizer
-    if use_sparse_emb and config.arch.puzzle_emb_ndim > 0 and not config.freeze_weights:
-        # Two optimizers: one for sparse embeddings, one for rest
-        # For now, use a single optimizer with masking
-        # TODO: Implement custom sparse embedding optimizer
-        optimizer = optax.chain(
+    if use_sparse_emb and config.arch.__pydantic_extra__.get('puzzle_emb_ndim', 0) > 0 and not config.freeze_weights:
+        # Custom SignSGD for sparse embeddings
+        def sign_sgd_with_decay(learning_rate_fn, weight_decay):
+            """SignSGD with decoupled weight decay for sparse embeddings."""
+            def init_fn(params):
+                return {}
+
+            def update_fn(updates, state, params):
+                # Apply weight decay if params provided
+                if params is not None:
+                    def apply_decay(p):
+                        lr = learning_rate_fn(state.get('step', 0))
+                        return p * (1.0 - lr * weight_decay)
+                    params = jax.tree_map(apply_decay, params)
+
+                # Take sign of gradients and scale by learning rate
+                def sign_update(g):
+                    lr = learning_rate_fn(state.get('step', 0))
+                    return -lr * jnp.sign(g)
+
+                signed_updates = jax.tree_map(sign_update, updates)
+                return signed_updates, state
+
+            return optax.GradientTransformation(init_fn, update_fn)
+
+        # Mask function to identify sparse embedding params
+        def is_sparse_emb_param(path, _):
+            # Check if this is a sparse embedding parameter
+            return 'puzzle_emb' in '/'.join(str(p) for p in path)
+
+        # Create masked optimizer
+        sparse_opt = sign_sgd_with_decay(sparse_lr_schedule, config.puzzle_emb_weight_decay)
+        regular_opt = optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.adamw(
                 learning_rate=lr_schedule,
@@ -215,6 +294,15 @@ def create_optimizer(config: PretrainConfig, total_steps: int, use_sparse_emb: b
                 b2=config.beta2,
                 weight_decay=config.weight_decay
             )
+        )
+
+        # Use multi_transform to apply different optimizers
+        optimizer = optax.multi_transform(
+            {
+                'sparse': sparse_opt,
+                'regular': regular_opt
+            },
+            lambda path_and_param: 'sparse' if is_sparse_emb_param(*path_and_param) else 'regular'
         )
     else:
         # Standard AdamW
@@ -282,28 +370,55 @@ def train_step(
     optimizer: optax.GradientTransformation,
     state: TrainState,
     batch: Dict[str, jnp.ndarray],
-    rng: random.PRNGKey
+    rng: random.PRNGKey,
+    max_act_steps: int = 100
 ) -> Tuple[TrainState, Dict[str, float]]:
-    """Single training step."""
+    """Single training step with ACT loop."""
 
-    def loss_fn(params, carry, batch, rng):
-        """Compute loss."""
-        # Forward pass
-        new_carry, outputs = model.apply(params, carry=carry, batch=batch, training=True, rng=rng)
+    def loss_fn(params, batch, rng):
+        """Compute loss with full ACT loop."""
+        # Initialize carry
+        carry = model.apply(params, batch=batch, method=model.initial_carry)
 
-        # Compute loss
-        new_carry, loss, metrics, _, all_halted = loss_head(
-            new_carry,
-            outputs,
-            return_keys=(),
-            training=True
-        )
+        total_loss = 0.0
+        all_metrics = {}
 
-        return loss, (metrics, new_carry)
+        # ACT loop: iterate until all sequences halt
+        for step_idx in range(max_act_steps):
+            # Split RNG for this step
+            rng, step_rng = random.split(rng)
+
+            # Forward pass
+            new_carry, outputs = model.apply(params, carry=carry, batch=batch, training=True, rng=step_rng)
+
+            # Compute loss for this step
+            new_carry, step_loss, metrics, _, all_halted = loss_head(
+                new_carry,
+                outputs,
+                return_keys=(),
+                training=True
+            )
+
+            total_loss += step_loss
+
+            # Accumulate metrics
+            if step_idx == 0:
+                all_metrics = {k: v for k, v in metrics.items()}
+            else:
+                all_metrics = {k: all_metrics[k] + v for k, v in metrics.items()}
+
+            carry = new_carry
+
+            # Stop if all sequences have halted
+            if all_halted:
+                all_metrics['act_steps'] = jnp.array(step_idx + 1, dtype=jnp.float32)
+                break
+
+        return total_loss, (all_metrics, carry)
 
     # Compute gradients
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (metrics, new_carry)), grads = grad_fn(state.params, state.carry, batch, rng)
+    (loss, (metrics, new_carry)), grads = grad_fn(state.params, batch, rng)
 
     # Apply gradients
     updates, new_opt_state = optimizer.update(grads, state.opt_state, state.params)
@@ -319,8 +434,17 @@ def train_step(
         carry=new_carry
     )
 
-    # Prepare metrics
-    metrics_dict = {f"train/{k}": float(v) for k, v in metrics.items()}
+    # Prepare metrics (normalize by count if available)
+    metrics_dict = {}
+    count = metrics.get('count', 1.0)
+    for k, v in metrics.items():
+        if k in ['accuracy', 'exact_accuracy', 'q_halt_accuracy']:
+            metrics_dict[f"train/{k}"] = float(v / jnp.maximum(count, 1.0))
+        elif k == 'steps':
+            metrics_dict[f"train/avg_{k}"] = float(v / jnp.maximum(count, 1.0))
+        else:
+            metrics_dict[f"train/{k}"] = float(v)
+
     metrics_dict["train/loss"] = float(loss)
 
     return new_state, metrics_dict
@@ -333,20 +457,29 @@ def evaluate(
     eval_loader,
     eval_metadata: PuzzleDatasetMetadata,
     evaluators: List[Any],
-    rng: random.PRNGKey
+    rng: random.PRNGKey,
+    max_act_steps: int = 100
 ) -> Dict[str, float]:
-    """Evaluation loop."""
+    """Evaluation loop with ACT."""
     all_metrics = {}
+    eval_loss = 0.0
+    eval_steps = 0
+
+    # Begin evaluation for all evaluators
+    for evaluator in evaluators:
+        evaluator.begin_eval()
 
     # Run model evaluation
     for set_name, batch, global_batch_size in eval_loader:
         # Initialize carry
         carry = model.apply(state.params, batch=batch, method=model.initial_carry)
 
-        # Run inference steps until all halt
-        inference_steps = 0
-        while True:
+        # ACT loop: run inference steps until all halt
+        step_predictions = None
+        for step_idx in range(max_act_steps):
             rng, step_rng = random.split(rng)
+
+            # Forward pass
             new_carry, outputs = model.apply(
                 state.params,
                 carry=carry,
@@ -355,18 +488,41 @@ def evaluate(
                 rng=step_rng
             )
 
+            # Compute loss and get predictions
+            new_carry, step_loss, metrics, step_outputs, all_halted = loss_head(
+                new_carry,
+                outputs,
+                return_keys=('logits',),
+                training=False
+            )
+
+            # Store predictions
+            step_predictions = {
+                'preds': step_outputs['preds'],
+                'q_halt_logits': outputs['q_halt_logits']
+            }
+
+            eval_loss += float(step_loss)
+            eval_steps += 1
+
             carry = new_carry
-            inference_steps += 1
 
             # Check if all halted
-            if jnp.all(carry.halted) or inference_steps >= 100:
+            if all_halted or jnp.all(carry.halted):
                 break
 
-        print(f"Evaluation for {set_name} completed in {inference_steps} steps")
+        # Update evaluators with final predictions
+        if step_predictions is not None:
+            for evaluator in evaluators:
+                evaluator.update_batch(batch, step_predictions)
 
-    # Run evaluators
+    # Compute average eval loss
+    if eval_steps > 0:
+        all_metrics['eval/loss'] = eval_loss / eval_steps
+
+    # Get evaluator results
     for evaluator in evaluators:
-        metrics = evaluator.result(save_path=None, rank=0, world_size=1, group=None)
+        metrics = evaluator.result(save_path=None, rank=jax.process_index(), world_size=jax.process_count(), group=None)
         if metrics is not None:
             all_metrics.update(metrics)
 
@@ -374,9 +530,12 @@ def evaluate(
 
 
 def save_checkpoint(state: TrainState, checkpoint_path: str, step: int):
-    """Save checkpoint using Orbax."""
+    """Save checkpoint using Orbax (supports GCS)."""
     ckpt_dir = os.path.join(checkpoint_path, f"step_{step}")
-    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # For GCS paths, Orbax handles them directly
+    if not checkpoint_path.startswith('gs://'):
+        os.makedirs(ckpt_dir, exist_ok=True)
 
     checkpointer = orbax.checkpoint.PyTreeCheckpointer()
     checkpointer.save(
@@ -409,7 +568,7 @@ def load_checkpoint(checkpoint_path: str, state: TrainState) -> TrainState:
     )
 
 
-@hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
+@hydra.main(config_path="kellen/configs", config_name="baseline", version_base=None)
 def launch(hydra_config: DictConfig):
     """Main training loop."""
     # Initialize JAX distributed
@@ -463,9 +622,16 @@ def launch(hydra_config: DictConfig):
             epochs_per_iter=1,
             global_batch_size=config.global_batch_size
         )
-    except:
-        print("NO EVAL DATA FOUND")
+        # Create evaluators
+        evaluators = create_evaluators(
+            config,
+            eval_metadata,
+            config.data_paths_test if config.data_paths_test else config.data_paths
+        )
+    except Exception as e:
+        print(f"NO EVAL DATA FOUND: {e}")
         eval_loader = eval_metadata = None
+        evaluators = []
 
     # Initialize training state
     with mesh:
@@ -507,6 +673,10 @@ def launch(hydra_config: DictConfig):
             if train_state.step >= train_state.total_steps:
                 break
 
+            # Shard batch across devices
+            with mesh:
+                batch = shard_batch(batch, mesh)
+
             rng, step_rng = random.split(rng)
             train_state, metrics = train_step_jit(train_state, batch, step_rng)
 
@@ -522,11 +692,12 @@ def launch(hydra_config: DictConfig):
             eval_metrics = evaluate(
                 model, loss_head, train_state,
                 eval_loader, eval_metadata,
-                [], eval_rng
+                evaluators, eval_rng
             )
 
             if process_index == 0 and eval_metrics:
                 wandb.log(eval_metrics, step=train_state.step)
+                print(f"Evaluation metrics: {eval_metrics}")
 
         # Checkpointing (only on process 0)
         if process_index == 0 and config.checkpoint_path is not None:

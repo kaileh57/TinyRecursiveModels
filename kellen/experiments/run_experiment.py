@@ -18,13 +18,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 def check_tpu_availability():
     """Check if TPU is available"""
     try:
-        import torch_xla
-        import torch_xla.core.xla_model as xm
-        device = xm.xla_device()
-        print(f"✓ TPU detected: {device}")
-        return True
+        import jax
+        devices = jax.devices()
+        tpu_devices = [d for d in devices if 'TPU' in str(d)]
+        if tpu_devices:
+            print(f"✓ TPU detected: {len(tpu_devices)} TPU cores")
+            print(f"  Process count: {jax.process_count()}")
+            print(f"  Device count: {jax.device_count()}")
+            return True
+        else:
+            print(f"⚠ Warning: No TPU found. Found {len(devices)} devices: {devices}")
+            return False
     except ImportError:
-        print("⚠ Warning: torch_xla not found. Will run on CPU/GPU.")
+        print("⚠ Warning: JAX not found. Will run on CPU/GPU.")
         return False
     except Exception as e:
         print(f"⚠ Warning: TPU initialization failed: {e}")
@@ -60,7 +66,7 @@ def verify_dataset(data_paths):
 
 def launch_single_process(config_file, use_tpu=True):
     """Launch training in single-process mode (for testing or GPU)"""
-    train_script = Path(__file__).parent / "train_tpu.py"
+    train_script = Path(__file__).parent.parent.parent / "pretrain_jax.py"
 
     cmd = [
         "python", str(train_script),
@@ -68,33 +74,26 @@ def launch_single_process(config_file, use_tpu=True):
         "--config-name", config_file.stem,
     ]
 
-    if not use_tpu:
-        cmd.append("use_tpu=false")
-
-    print(f"\nLaunching single-process training...")
+    print(f"\nLaunching single-process JAX training...")
     print(f"Command: {' '.join(cmd)}\n")
 
     return subprocess.run(cmd)
 
 
 def launch_tpu_distributed(config_file, tpu_name="stable-1", num_workers=8):
-    """Launch training on TPU using xla_dist"""
-    train_script = Path(__file__).parent / "train_tpu.py"
+    """Launch training on TPU using JAX distributed"""
+    train_script = Path(__file__).parent.parent.parent / "pretrain_jax.py"
 
+    # For JAX multi-host TPU, we just run the script directly
+    # JAX handles the distributed initialization automatically
     cmd = [
-        "python", "-m", "torch_xla.distributed.xla_dist",
-        "--tpu", tpu_name,
-        "--restart-tpuvm-pod-server",
-        "--",
         "python", str(train_script),
         "--config-path", str(config_file.parent),
         "--config-name", config_file.stem,
-        f"num_workers={num_workers}",
-        "use_tpu=true",
     ]
 
-    print(f"\nLaunching TPU distributed training on {tpu_name}...")
-    print(f"Workers: {num_workers}")
+    print(f"\nLaunching JAX TPU distributed training...")
+    print(f"Note: JAX automatically handles multi-host coordination")
     print(f"Command: {' '.join(cmd)}\n")
 
     return subprocess.run(cmd)
