@@ -69,11 +69,16 @@ launch_worker() {
         export JAX_PLATFORMS=tpu
         export TF_CPP_MIN_LOG_LEVEL=0
 
+        # Set coordinator address to worker 0's internal IP on port 1234
+        # Worker 0 will be the coordinator for all processes
+        export COORDINATOR_ADDRESS=\"\$(gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format='value(networkEndpoints[0].ipAddress)'):1234\"
+
         cd ${PROJECT_DIR}
 
         echo '=== Worker ${worker_id} Environment ==='
         echo \"JAX_PROCESS_COUNT=\${JAX_PROCESS_COUNT}\"
         echo \"JAX_PROCESS_INDEX=\${JAX_PROCESS_INDEX}\"
+        echo \"COORDINATOR_ADDRESS=\${COORDINATOR_ADDRESS}\"
         echo \"PWD=\$(pwd)\"
         echo '======================================'
 

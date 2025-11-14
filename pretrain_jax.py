@@ -565,14 +565,25 @@ def launch(hydra_config: DictConfig):
     """Main training loop."""
     # Initialize JAX distributed for multi-host TPU
     try:
-        jax.distributed.initialize()
+        coordinator_address = os.environ.get('COORDINATOR_ADDRESS', 'localhost:1234')
+        num_processes = int(os.environ.get('JAX_PROCESS_COUNT', '1'))
+        process_id = int(os.environ.get('JAX_PROCESS_INDEX', '0'))
+
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=num_processes,
+            process_id=process_id
+        )
         print(f"✓ JAX distributed initialized successfully")
+        print(f"  Coordinator: {coordinator_address}")
+        print(f"  Process: {process_id}/{num_processes}")
     except Exception as e:
         print(f"⚠ JAX distributed initialization failed: {e}")
         print("  This is expected for single-host testing")
         print("  For TPU v4-64, ensure all 8 workers are running with:")
         print("  - JAX_PROCESS_COUNT=8")
         print("  - JAX_PROCESS_INDEX=0-7 (unique per worker)")
+        print("  - COORDINATOR_ADDRESS=<worker-0-ip>:1234")
 
     # Get process info
     process_index = jax.process_index()
@@ -617,13 +628,15 @@ def launch(hydra_config: DictConfig):
         }
 
         # Broadcast from process 0 to all workers
-        for key in config_dict:
-            arr = jnp.array([ord(c) for c in config_dict[key]] + [0], dtype=jnp.int32)
-            # Pad to fixed size
-            arr = jnp.pad(arr, (0, max(0, 256 - len(arr))), constant_values=0)[:256]
-            synced_arr = jax.lax.all_gather(arr, 'data')[0]
-            synced_str = ''.join([chr(int(x)) for x in synced_arr if x != 0])
-            config_dict[key] = synced_str
+        # CRITICAL: Must be inside mesh context to use 'data' axis
+        with mesh:
+            for key in config_dict:
+                arr = jnp.array([ord(c) for c in config_dict[key]] + [0], dtype=jnp.int32)
+                # Pad to fixed size
+                arr = jnp.pad(arr, (0, max(0, 256 - len(arr))), constant_values=0)[:256]
+                synced_arr = jax.lax.all_gather(arr, 'data')[0]
+                synced_str = ''.join([chr(int(x)) for x in synced_arr if x != 0])
+                config_dict[key] = synced_str
 
         # Update config on non-zero workers
         if process_index != 0:
