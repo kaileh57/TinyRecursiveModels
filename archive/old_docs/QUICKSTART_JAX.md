@@ -1,4 +1,4 @@
-# TRM Scaling Research - Quick Start Guide
+# TRM Scaling Research - Quick Start Guide (JAX)
 
 Get up and running with TRM experiments on TPU v4-64 in under 30 minutes.
 
@@ -6,9 +6,10 @@ Get up and running with TRM experiments on TPU v4-64 in under 30 minutes.
 
 ## Prerequisites
 
-✅ TPU v4-64 node `stable-1` is provisioned and running
-✅ You have SSH access to the node
+✅ TPU v4-64 node provisioned and running
+✅ You have SSH access to the TPU VM
 ✅ WandB account created (get free account at https://wandb.ai)
+✅ GCS bucket `gs://sculptor-tpu-experiments/` accessible
 
 ---
 
@@ -20,10 +21,9 @@ Get up and running with TRM experiments on TPU v4-64 in under 30 minutes.
 # SSH into your TPU node
 gcloud compute tpus tpu-vm ssh stable-1 \
   --zone=us-central2-b \
-  --project=YOUR_PROJECT_ID
+  --project=YOUR_PROJECT_ID \
+  --worker=all  # Connect to all 8 workers
 ```
-
-**Note:** The node is already set up and persistent, so you should already be on it.
 
 ### 2. Verify TPU
 
@@ -45,17 +45,26 @@ cd /home/user/TinyRecursiveModels
 ### 4. Install Dependencies (First Time Only)
 
 ```bash
-# Install PyTorch/XLA for TPU
-pip install torch~=2.1.0 torch_xla[tpu]~=2.1.0 \
-  -f https://storage.googleapis.com/libtpu-releases/index.html
+# Run the automated setup script
+bash setup_tpu.sh
+```
+
+This script will:
+- Install JAX with TPU support
+- Install Flax, Optax, and Orbax
+- Install project dependencies
+- Verify TPU detection
+
+**Manual installation:**
+
+```bash
+# Install JAX with TPU support
+pip install --upgrade pip
+pip install "jax[tpu]>=0.4.20" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install flax>=0.8.0 optax>=0.1.7 orbax-checkpoint>=0.4.0
 
 # Install project dependencies
 pip install -r requirements.txt
-pip install wandb pydantic omegaconf hydra-core coolname tqdm pyyaml
-pip install matplotlib seaborn pandas scipy
-
-# Install optimizer (optional)
-pip install --no-cache-dir --no-build-isolation adam-atan2
 
 # Login to WandB
 wandb login YOUR_API_KEY
@@ -66,10 +75,15 @@ Get your WandB API key from: https://wandb.ai/authorize
 ### 5. Verify Installation
 
 ```bash
-python -c "import torch_xla.core.xla_model as xm; print('TPU cores:', xm.xrt_world_size())"
+python -c "import jax; print('JAX version:', jax.__version__); print('Devices:', jax.devices()); print('Device count:', jax.device_count())"
 ```
 
-Expected output: `TPU cores: 8`
+Expected output:
+```
+JAX version: 0.4.20
+Devices: [TpuDevice(id=0), TpuDevice(id=1), ..., TpuDevice(id=63)]
+Device count: 64
+```
 
 ---
 
@@ -95,10 +109,13 @@ This creates:
 
 ```bash
 # Short test run to verify everything works
-python kellen/experiments/run_experiment.py baseline epochs=1000
+python kellen/experiments/run_experiment.py baseline --dry-run
+
+# Actually run a short test
+python pretrain_jax.py --config-name baseline epochs=100
 ```
 
-This trains for 1000 epochs (~5 min) to verify the pipeline works.
+This trains for 100 epochs (~5 min) to verify the pipeline works.
 
 ### Option B: Full Baseline (40 hours)
 
@@ -128,14 +145,14 @@ Reattach anytime with: `tmux attach -t baseline`
    - Learning rate
    - Throughput
 
-### Local Logs
+### Check Checkpoints
 
 ```bash
-# View training output
-tail -f kellen/logs/batch_runs/baseline_stdout.log
+# View saved checkpoints
+gsutil ls gs://sculptor-tpu-experiments/checkpoints/
 
-# View errors (if any)
-tail -f kellen/logs/batch_runs/baseline_stderr.log
+# Download specific checkpoint
+gsutil cp -r gs://sculptor-tpu-experiments/checkpoints/exp01-model-scaling/exp01a ./
 ```
 
 ---
@@ -145,24 +162,28 @@ tail -f kellen/logs/batch_runs/baseline_stderr.log
 ### List All Experiments
 
 ```bash
-python kellen/experiments/run_experiment_batch.py --list
+ls kellen/configs/experiments/
 ```
 
 Shows all 67 available experiment configs.
 
-### Run Experiment Group
+### Run Single Experiment
 
 ```bash
-# Model size scaling (Experiment 1: 6 configs)
-tmux new -s exp01
-python kellen/experiments/run_experiment_batch.py --pattern exp01
-# Detach: Ctrl+B, D
+# Run specific experiment
+python kellen/experiments/run_experiment.py exp01a
+
+# Or use pretrain_jax.py directly
+python pretrain_jax.py --config-path kellen/configs/experiments --config-name exp01a
 ```
 
-### Run Specific Experiments
+### Run Experiment Batch
 
 ```bash
-# Run 3 specific experiments
+# Run all model scaling experiments (exp01a-f)
+python kellen/experiments/run_experiment_batch.py --pattern exp01
+
+# Run specific experiments
 python kellen/experiments/run_experiment_batch.py exp01a exp01b exp01c
 ```
 
@@ -172,22 +193,30 @@ python kellen/experiments/run_experiment_batch.py exp01a exp01b exp01c
 
 ### Checkpoints
 
-Automatically saved to:
+Automatically saved to GCS:
 ```
-kellen/checkpoints/PROJECT_NAME/RUN_NAME/step_XXXXX.pt
+gs://sculptor-tpu-experiments/checkpoints/{experiment_group}/{experiment_name}/step_{STEP}/
 ```
+
+Examples:
+- `gs://sculptor-tpu-experiments/checkpoints/exp01-model-scaling/exp01a/step_10000/`
+- `gs://sculptor-tpu-experiments/checkpoints/baseline/step_50000/`
 
 Frequency:
 - Every 1000 steps
-- After each evaluation (every 5000 epochs)
+- After each evaluation
 
 ### View Results
 
 **WandB:** https://wandb.ai → Your project → Compare runs
 
-**Local:**
+**GCS:**
 ```bash
-ls kellen/checkpoints/TRM-Exp01-ModelScaling/
+# List all checkpoints
+gsutil ls -r gs://sculptor-tpu-experiments/checkpoints/
+
+# Download specific experiment results
+gsutil -m cp -r gs://sculptor-tpu-experiments/checkpoints/exp01-model-scaling/exp01a ./results/
 ```
 
 ---
@@ -200,14 +229,14 @@ ls kellen/checkpoints/TRM-Exp01-ModelScaling/
 # Run single experiment
 python kellen/experiments/run_experiment.py EXPERIMENT_NAME
 
-# Run multiple experiments
-python kellen/experiments/run_experiment_batch.py --pattern PATTERN
+# Run with custom config override
+python pretrain_jax.py --config-name EXPERIMENT epochs=10000 lr=0.0001
 
-# Dry run (test config)
+# Dry run (test config without training)
 python kellen/experiments/run_experiment.py EXPERIMENT_NAME --dry-run
 
 # List all experiments
-python kellen/experiments/run_experiment_batch.py --list
+ls kellen/configs/experiments/*.yaml
 ```
 
 ### Tmux (Session Management)
@@ -237,6 +266,9 @@ gcloud compute tpus tpu-vm describe stable-1 \
   --zone=us-central2-b \
   --format="value(state,health)"
 
+# Check JAX can see TPU
+python -c "import jax; print('Devices:', jax.device_count())"
+
 # Restart TPU (if needed)
 gcloud compute tpus tpu-vm stop stable-1 --zone=us-central2-b
 gcloud compute tpus tpu-vm start stable-1 --zone=us-central2-b
@@ -246,11 +278,18 @@ gcloud compute tpus tpu-vm start stable-1 --zone=us-central2-b
 
 ## Troubleshooting
 
-### "torch_xla not found"
+### "JAX cannot find TPU"
 
 ```bash
-pip install torch~=2.1.0 torch_xla[tpu]~=2.1.0 \
-  -f https://storage.googleapis.com/libtpu-releases/index.html
+# Check TPU environment variables
+echo $TPU_NAME
+echo $TPU_WORKER_ID
+
+# Verify JAX installation
+pip install --upgrade "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# Test TPU detection
+python -c "import jax; print(jax.devices())"
 ```
 
 ### "Dataset not found"
@@ -274,6 +313,44 @@ global_batch_size: 3072  # Down from 6144
 ```bash
 wandb login YOUR_API_KEY
 ```
+
+### "GCS permission denied"
+
+```bash
+# Verify bucket access
+gsutil ls gs://sculptor-tpu-experiments/
+
+# If denied, check GCP permissions or create bucket
+gsutil mb gs://sculptor-tpu-experiments/
+```
+
+---
+
+## Multi-Host TPU v4-64 Notes
+
+TPU v4-64 has **8 separate worker VMs**, each controlling 8 cores.
+
+JAX automatically handles multi-host coordination when you:
+
+1. **Connect to all workers:** Use `--worker=all` with gcloud ssh
+2. **Run same script on all workers:** Use `gcloud compute tpus tpu-vm ssh --command`
+3. **JAX distributed init:** `jax.distributed.initialize()` (automatic on TPU)
+
+**Example: Run on all workers simultaneously**
+
+```bash
+# Execute command on all 8 workers
+gcloud compute tpus tpu-vm ssh stable-1 \
+  --zone=us-central2-b \
+  --worker=all \
+  --command="cd /home/user/TinyRecursiveModels && python pretrain_jax.py --config-name baseline"
+```
+
+JAX will automatically:
+- Detect it's running on 8 hosts
+- Assign process IDs 0-7
+- Coordinate training across all hosts
+- Shard data and model appropriately
 
 ---
 
@@ -300,19 +377,10 @@ wandb login YOUR_API_KEY
 ## Full Documentation
 
 For complete details, see:
-- **Setup Guide:** `kellen/SETUP_GUIDE.md` - Complete setup and usage
-- **README:** `kellen/README.md` - Project overview
+- **TPU Readiness Assessment:** `TPU_V4_READINESS_ASSESSMENT.md` - Current status
+- **JAX Port Summary:** `JAX_PORT_SUMMARY.md` - Migration notes
+- **README:** `README.md` - Project overview
 - **Master Plan:** `kellen/plans/00_MASTER_PLAN.txt` - Research strategy
-- **Experiment Specs:** `kellen/plans/02_EXPERIMENT_SPECS.txt` - Detailed specs
-
----
-
-## Support
-
-- **Logs:** Check `kellen/logs/` for error messages
-- **WandB:** Monitor training at https://wandb.ai
-- **TPU Status:** `gcloud compute tpus tpu-vm describe stable-1`
-- **TRM Paper:** https://arxiv.org/abs/2510.04871
 
 ---
 

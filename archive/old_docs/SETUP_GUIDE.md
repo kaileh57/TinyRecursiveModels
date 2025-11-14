@@ -1,7 +1,16 @@
-# TRM Scaling Research - Complete Setup and Execution Guide
+# ⚠️ DEPRECATED - This guide is outdated
+
+**This guide references PyTorch/XLA which is no longer used.**
+
+**→ See [QUICKSTART_JAX.md](QUICKSTART_JAX.md) for the correct JAX-based setup.**
+**→ See [README_JAX.md](../README_JAX.md) for JAX implementation details.**
+
+---
+
+# TRM Scaling Research - Complete Setup and Execution Guide (DEPRECATED)
 
 **Target Hardware:** Google Cloud TPU v4-64 (Node: stable-1)
-**Framework:** PyTorch/XLA
+**Framework:** ~~PyTorch/XLA~~ **JAX/Flax (see QUICKSTART_JAX.md)**
 **Distributed:** 8 workers, 64 TPU cores total
 
 ---

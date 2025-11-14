@@ -1,6 +1,3 @@
-# Auto-generated experiment configuration
-# DO NOT EDIT MANUALLY - regenerate with generate_experiment_configs.py
-
 defaults:
 - arch_config: trm_baseline
 - _self_
@@ -30,6 +27,6 @@ freeze_weights: false
 seed: 0
 project_name: TRM-Exp04a-DataScaling
 run_name: exp04a_1000_train1000
-checkpoint_path: null
+checkpoint_path: gs://sculptor-tpu-experiments/checkpoints/exp04a-data-scaling/exp04a_1000
 load_checkpoint: null
 eval_save_outputs: []
