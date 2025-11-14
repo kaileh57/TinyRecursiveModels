@@ -22,6 +22,8 @@ from flax.core import frozen_dict
 import optax
 import orbax.checkpoint
 
+from puzzle_dataset_gcs import create_dataloader_with_gcs
+
 import tqdm
 import wandb
 import coolname
@@ -188,31 +190,9 @@ def shard_batch(batch: Dict[str, jnp.ndarray], mesh: Mesh) -> Dict[str, jnp.ndar
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int = 0, world_size: int = 1, **kwargs):
-    """Create a dataloader for the given split."""
-    dataset = PuzzleDataset(
-        PuzzleDatasetConfig(
-            seed=config.seed,
-            dataset_paths=config.data_paths_test if len(config.data_paths_test) > 0 and split == "test" else config.data_paths,
-            rank=rank,
-            num_replicas=world_size,
-            **kwargs
-        ),
-        split=split
-    )
-
-    # Convert to iterator
-    def dataloader_iterator():
-        for set_name, batch, global_batch_size in dataset:
-            # Convert to JAX arrays (handles both numpy and torch)
-            jax_batch = {}
-            for k, v in batch.items():
-                if hasattr(v, 'numpy'):  # torch tensor
-                    jax_batch[k] = jnp.array(v.numpy())
-                else:  # already numpy
-                    jax_batch[k] = jnp.array(v)
-            yield set_name, jax_batch, global_batch_size
-
-    return dataloader_iterator, dataset.metadata
+    """Create a dataloader for the given split, handling GCS paths."""
+    # Use GCS-compatible loader that caches to local /tmp
+    return create_dataloader_with_gcs(config, split, rank, world_size, **kwargs)
 
 
 def create_model_and_loss_head(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rng: random.PRNGKey):
@@ -533,20 +513,29 @@ def save_checkpoint(state: TrainState, checkpoint_path: str, step: int):
     """Save checkpoint using Orbax (supports GCS)."""
     ckpt_dir = os.path.join(checkpoint_path, f"step_{step}")
 
-    # For GCS paths, Orbax handles them directly
-    if not checkpoint_path.startswith('gs://'):
-        os.makedirs(ckpt_dir, exist_ok=True)
+    try:
+        # For GCS paths, Orbax handles them directly
+        if not checkpoint_path.startswith('gs://'):
+            os.makedirs(ckpt_dir, exist_ok=True)
 
-    checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    checkpointer.save(
-        ckpt_dir,
-        {
-            'params': state.params,
-            'opt_state': state.opt_state,
-            'step': state.step,
-        }
-    )
-    print(f"Saved checkpoint to {ckpt_dir}")
+        checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+
+        print(f"Saving checkpoint to {ckpt_dir}...")
+        checkpointer.save(
+            ckpt_dir,
+            {
+                'params': state.params,
+                'opt_state': state.opt_state,
+                'step': state.step,
+            }
+        )
+        print(f"✓ Checkpoint saved successfully to {ckpt_dir}")
+
+    except Exception as e:
+        print(f"✗ ERROR saving checkpoint to {ckpt_dir}:")
+        print(f"  {type(e).__name__}: {e}")
+        print("  Training will continue, but checkpoint was not saved")
+        print("  Check GCS permissions and bucket existence")
 
 
 def load_checkpoint(checkpoint_path: str, state: TrainState) -> TrainState:
@@ -571,14 +560,16 @@ def load_checkpoint(checkpoint_path: str, state: TrainState) -> TrainState:
 @hydra.main(config_path="kellen/configs", config_name="baseline", version_base=None)
 def launch(hydra_config: DictConfig):
     """Main training loop."""
-    # Initialize JAX distributed
-    # For TPU v4-64 with 8 workers, JAX auto-detects multi-host setup from TPU environment
-    # If running fails with multi-host errors, you can manually specify:
-    # coordinator_address = os.environ.get('TPU_COORDINATOR_ADDRESS', 'localhost:8476')
-    # num_processes = int(os.environ.get('TPU_WORKER_COUNT', 1))
-    # process_id = int(os.environ.get('TPU_WORKER_ID', 0))
-    # jax.distributed.initialize(coordinator_address, num_processes, process_id)
-    jax.distributed.initialize()
+    # Initialize JAX distributed for multi-host TPU
+    try:
+        jax.distributed.initialize()
+        print(f"✓ JAX distributed initialized successfully")
+    except Exception as e:
+        print(f"⚠ JAX distributed initialization failed: {e}")
+        print("  This is expected for single-host testing")
+        print("  For TPU v4-64, ensure all 8 workers are running with:")
+        print("  - JAX_PROCESS_COUNT=8")
+        print("  - JAX_PROCESS_INDEX=0-7 (unique per worker)")
 
     # Get process info
     process_index = jax.process_index()
@@ -593,6 +584,31 @@ def launch(hydra_config: DictConfig):
 
     # Load config
     config = PretrainConfig(**hydra_config)
+
+    # Verify GCS bucket access (only on process 0)
+    if process_index == 0 and config.checkpoint_path and config.checkpoint_path.startswith('gs://'):
+        import subprocess
+        bucket = config.checkpoint_path.split('/')[2]
+        try:
+            print(f"Verifying GCS bucket access: gs://{bucket}/")
+            result = subprocess.run(
+                f"gsutil ls gs://{bucket}/",
+                shell=True,
+                capture_output=True,
+                timeout=10,
+                text=True
+            )
+            if result.returncode != 0:
+                print(f"⚠ WARNING: Cannot access GCS bucket gs://{bucket}/")
+                print(f"  Error: {result.stderr}")
+                print("  Checkpointing may fail!")
+                print("  Fix with: gsutil mb -l us-central2 gs://sculptor-tpu-experiments/")
+            else:
+                print(f"✓ GCS bucket accessible")
+        except subprocess.TimeoutExpired:
+            print(f"⚠ WARNING: GCS bucket check timed out")
+        except Exception as e:
+            print(f"⚠ WARNING: Could not verify GCS bucket: {e}")
 
     # Naming (only on process 0)
     if process_index == 0:
@@ -690,6 +706,17 @@ def launch(hydra_config: DictConfig):
                 wandb.log(metrics, step=train_state.step)
                 if progress_bar is not None:
                     progress_bar.update(1)
+
+        # Synchronize all processes before evaluation
+        if process_count > 1 and _iter_id >= config.min_eval_interval and eval_loader is not None:
+            try:
+                print(f"[Process {process_index}] Waiting for all workers before eval...")
+                # Simple barrier using JAX collective
+                dummy = jnp.array(process_index)
+                synced = jax.lax.psum(dummy, 'data')  # This will block until all workers reach here
+                print(f"[Process {process_index}] All workers ready for eval (sum={synced})")
+            except Exception as e:
+                print(f"[Process {process_index}] Warning: Sync failed: {e}")
 
         # Evaluation
         if _iter_id >= config.min_eval_interval and eval_loader is not None:

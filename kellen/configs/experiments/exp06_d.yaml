@@ -4,7 +4,7 @@ defaults:
 use_tpu: true
 num_workers: 8
 data_paths:
-- data/sudoku-extreme-1k-aug-1000
+- gs://sculptor-tpu-experiments/data/sudoku-extreme-1k-aug-1000
 data_paths_test: []
 evaluators: []
 global_batch_size: 12288
