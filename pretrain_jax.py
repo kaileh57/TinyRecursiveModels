@@ -381,6 +381,12 @@ def train_step(
 
             total_loss += step_loss
 
+            # Safety check: exit early if loss diverges
+            if jnp.isnan(total_loss) or total_loss > 1e6:
+                all_metrics['act_steps'] = jnp.array(step_idx + 1, dtype=jnp.float32)
+                all_metrics['diverged'] = jnp.array(1.0, dtype=jnp.float32)
+                break
+
             # Accumulate metrics
             if step_idx == 0:
                 all_metrics = {k: v for k, v in metrics.items()}
@@ -579,6 +585,16 @@ def launch(hydra_config: DictConfig):
     # Create mesh for distributed training
     mesh = create_mesh()
 
+    # Validate mesh configuration
+    expected_devices = 64 if process_count == 8 else jax.device_count()
+    actual_devices = mesh.devices.size
+    if actual_devices != expected_devices:
+        print(f"⚠ WARNING: Expected {expected_devices} devices, got {actual_devices}")
+        print(f"  This may indicate incomplete TPU initialization")
+    else:
+        print(f"✓ Mesh validated: {mesh.devices.shape} with axes {mesh.axis_names}")
+        print(f"✓ Total devices in mesh: {actual_devices}")
+
     # Load config
     config = PretrainConfig(**hydra_config)
 
@@ -658,6 +674,26 @@ def launch(hydra_config: DictConfig):
             config, train_metadata, mesh, init_rng
         )
 
+    # Load checkpoint if specified (for resuming from preemptible TPU or failures)
+    if config.load_checkpoint is not None and process_index == 0:
+        print(f"Loading checkpoint from: {config.load_checkpoint}")
+        try:
+            train_state = load_checkpoint(config.load_checkpoint, train_state)
+            print(f"✓ Resumed from step {train_state.step}/{train_state.total_steps}")
+        except Exception as e:
+            print(f"⚠ Failed to load checkpoint: {e}")
+            print(f"  Starting from scratch instead")
+
+    # Broadcast loaded step to all workers for synchronization
+    if process_count > 1:
+        # Ensure all workers know the correct starting step
+        with mesh:
+            step_arr = jnp.array([train_state.step], dtype=jnp.int32)
+            synced_step = jax.lax.all_gather(step_arr, 'data')[0]
+            train_state.step = int(synced_step[0])
+        if process_index == 0:
+            print(f"✓ All workers synchronized at step {train_state.step}")
+
     # JIT compile training step
     train_step_jit = jax.jit(
         partial(train_step, model, loss_head, optimizer),
@@ -703,14 +739,12 @@ def launch(hydra_config: DictConfig):
                 if progress_bar is not None:
                     progress_bar.update(1)
 
-        # Synchronize all processes before evaluation
-        if process_count > 1 and _iter_id >= config.min_eval_interval and eval_loader is not None:
-            try:
-                # Simple barrier using JAX collective
-                dummy = jnp.array(process_index)
-                synced = jax.lax.psum(dummy, 'data')  # This will block until all workers reach here
-            except Exception as e:
-                pass  # Silent sync failure
+        # Synchronize all processes before evaluation (CRITICAL: must be outside conditionals)
+        # All workers must reach this barrier regardless of eval_loader state to prevent deadlock
+        if process_count > 1:
+            with mesh:
+                dummy = jnp.ones(1)
+                _ = jax.lax.psum(dummy, 'data')  # Barrier: all workers block here
 
         # Evaluation
         if _iter_id >= config.min_eval_interval and eval_loader is not None:
