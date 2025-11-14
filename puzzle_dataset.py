@@ -4,8 +4,18 @@ from typing import Tuple, List, Dict, Optional
 import numpy as np
 import pydantic
 
-import torch
-from torch.utils.data import IterableDataset, get_worker_info
+# Remove PyTorch dependency - we'll use pure numpy
+try:
+    import torch
+    from torch.utils.data import IterableDataset, get_worker_info
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    # Create dummy base class for JAX
+    class IterableDataset:
+        pass
+    def get_worker_info():
+        return None
 
 from models.losses import IGNORE_LABEL_ID
 from dataset.common import PuzzleDatasetMetadata
@@ -162,8 +172,11 @@ class PuzzleDataset(IterableDataset):
             }
             batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
 
-        # To tensor
-        return {k: torch.from_numpy(v) for k, v in batch.items()}
+        # Return numpy arrays (JAX-compatible) or torch tensors if using PyTorch
+        if HAS_TORCH and hasattr(torch, 'from_numpy'):
+            return {k: torch.from_numpy(v) for k, v in batch.items()}
+        else:
+            return batch
     
     def _iter_test(self):
         for set_i, (set_name, dataset) in enumerate(self._data.items()):  # type: ignore

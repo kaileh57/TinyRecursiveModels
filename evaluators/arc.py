@@ -2,13 +2,49 @@ from typing import Dict, Sequence, Optional
 import os
 import json
 
-import torch
 import numpy as np
 from numba import njit
-import torch.distributed as dist
+
+# Support both PyTorch and JAX
+try:
+    import torch
+    import torch.distributed as dist
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    # Dummy torch module for JAX
+    class torch:
+        @staticmethod
+        def Tensor(x):
+            return x
+    class dist:
+        @staticmethod
+        def gather_object(obj, obj_list, dst, group):
+            # Simple single-process fallback
+            if obj_list is not None:
+                obj_list[0] = obj
+
+try:
+    import jax
+    import jax.numpy as jnp
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
 
 from dataset.build_arc_dataset import inverse_aug, grid_hash, arc_grid_to_np
 from dataset.common import PuzzleDatasetMetadata
+
+
+def to_numpy(arr):
+    """Convert array to numpy (works with torch, jax, or numpy)."""
+    if isinstance(arr, np.ndarray):
+        return arr
+    elif HAS_TORCH and isinstance(arr, torch.Tensor):
+        return arr.cpu().numpy()
+    elif HAS_JAX and isinstance(arr, jnp.ndarray):
+        return np.array(arr)
+    else:
+        return np.array(arr)
 
 @njit
 def _crop(grid: np.ndarray):
@@ -66,8 +102,8 @@ class ARC:
             self._local_hmap = {}
             self._local_preds = {}
     
-    def update_batch(self, batch: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor]):
-        # Collect required outputs to CPU
+    def update_batch(self, batch: Dict, preds: Dict):
+        # Collect required outputs and convert to numpy
         outputs = {}
         q_values = None
 
@@ -75,10 +111,12 @@ class ARC:
             for k, v in collection.items():
                 if k in self.required_outputs:
                     if k == "q_halt_logits":
-                        q_values = v.to(torch.float64).sigmoid().cpu()
+                        # Convert to numpy and apply sigmoid
+                        v_np = to_numpy(v).astype(np.float64)
+                        q_values = 1.0 / (1.0 + np.exp(-v_np))  # sigmoid
                     else:
-                        outputs[k] = v.cpu()
-                        
+                        outputs[k] = to_numpy(v)
+
         assert q_values is not None
 
         # Remove padding from outputs
@@ -86,7 +124,7 @@ class ARC:
         outputs = {k: v[mask] for k, v in outputs.items()}
 
         # Get predictions
-        for identifier, input, pred, q in zip(outputs["puzzle_identifiers"].numpy(), outputs["inputs"].numpy(), outputs["preds"].numpy(), q_values.numpy()):
+        for identifier, input, pred, q in zip(outputs["puzzle_identifiers"], outputs["inputs"], outputs["preds"], q_values):
             name = self.identifier_map[identifier]
             orig_name, _inverse_fn = inverse_aug(name)
             
@@ -104,10 +142,15 @@ class ARC:
             self._local_preds[orig_name].setdefault(input_hash, [])
             self._local_preds[orig_name][input_hash].append((pred_hash, float(q)))
     
-    def result(self, save_path: Optional[str], rank: int, world_size: int, group: Optional[torch.distributed.ProcessGroup] = None) -> Optional[Dict[str, float]]:
+    def result(self, save_path: Optional[str], rank: int, world_size: int, group: Optional = None) -> Optional[Dict[str, float]]:
         # Gather predictions to rank 0 for voting
-        global_hmap_preds = [None for _ in range(world_size)] if rank == 0 else None
-        dist.gather_object((self._local_hmap, self._local_preds), global_hmap_preds, dst=0, group=group)
+        if HAS_TORCH and world_size > 1:
+            global_hmap_preds = [None for _ in range(world_size)] if rank == 0 else None
+            dist.gather_object((self._local_hmap, self._local_preds), global_hmap_preds, dst=0, group=group)
+        else:
+            # Single process fallback (for JAX or single GPU)
+            global_hmap_preds = [(self._local_hmap, self._local_preds)]
+            rank = 0
         
         # Rank 0 logic
         if rank != 0:
