@@ -719,6 +719,7 @@ def launch(hydra_config: DictConfig):
             project=config.project_name,
             name=config.run_name,
             config=config.model_dump(),
+            mode='offline',  # Offline mode for TPU - sync later with 'wandb sync'
             settings=wandb.Settings(_disable_stats=True)
         )
 
