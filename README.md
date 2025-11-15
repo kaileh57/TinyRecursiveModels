@@ -6,6 +6,19 @@
 
 ---
 
+## About TRM
+
+Tiny Recursion Model (TRM) is a recursive reasoning model that achieves 45% on ARC-AGI-1 and 8% on ARC-AGI-2 with only 7M parameters. Instead of relying on massive foundation models, TRM demonstrates that a tiny model can solve hard reasoning tasks by recursively improving its predictions over time.
+
+**How TRM Works:**
+TRM recursively improves its predicted answer with a tiny network. It starts with an embedded input question and initial answer, then for up to K improvement steps, it:
+1. Recursively updates its latent state given the question, current answer, and current latent (recursive reasoning)
+2. Updates its answer given the current latent state
+
+This recursive process allows the model to progressively improve answers in an extremely parameter-efficient manner while minimizing overfitting.
+
+---
+
 ## Quick Setup
 
 ### 1. Install JAX on TPU
@@ -633,6 +646,26 @@ Ctrl+B, D                               # Detach
 tmux attach -t exp_name                 # Reattach
 tmux ls                                 # List sessions
 ```
+
+---
+
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@misc{jolicoeurmartineau2025morerecursivereasoningtiny,
+      title={Less is More: Recursive Reasoning with Tiny Networks},
+      author={Alexia Jolicoeur-Martineau},
+      year={2025},
+      eprint={2510.04871},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2510.04871},
+}
+```
+
+This code builds upon the Hierarchical Reasoning Model (HRM) framework.
 
 ---
 
