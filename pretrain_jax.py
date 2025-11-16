@@ -561,7 +561,7 @@ def load_checkpoint(checkpoint_path: str, state: TrainState) -> TrainState:
     )
 
 
-@hydra.main(config_path="kellen/configs", version_base=None)
+@hydra.main(config_path="kellen/configs")
 def launch(hydra_config: DictConfig):
     """Main training loop."""
     # Initialize JAX distributed for multi-host TPU
