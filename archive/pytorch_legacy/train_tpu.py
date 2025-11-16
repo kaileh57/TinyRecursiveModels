@@ -703,7 +703,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int, use
     return objects[0]
 
 
-@hydra.main(config_path="../configs", config_name="baseline", version_base=None)
+@hydra.main(config_path="../configs", version_base=None)
 def launch(hydra_config: DictConfig):
     """Main training function"""
     # Determine if we're using TPU

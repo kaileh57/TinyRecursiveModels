@@ -1,6 +1,7 @@
 """
 JAX-based training script for TinyRecursiveModels on TPU v4-64 (32 chips, 64 cores, 8x4 workers)
 """
+from __future__ import annotations
 from typing import Optional, Any, Sequence, List, Dict, Tuple
 from dataclasses import dataclass
 import os
@@ -560,7 +561,7 @@ def load_checkpoint(checkpoint_path: str, state: TrainState) -> TrainState:
     )
 
 
-@hydra.main(config_path="kellen/configs", config_name="baseline", version_base=None)
+@hydra.main(config_path="kellen/configs", version_base=None)
 def launch(hydra_config: DictConfig):
     """Main training loop."""
     # Initialize JAX distributed for multi-host TPU
